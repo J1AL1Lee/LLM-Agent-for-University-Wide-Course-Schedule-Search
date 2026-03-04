@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# runtime / local data
+output/
+*.log
+
+# local env secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jiaowu-crawler"
+version = "0.1.0"
+description = "BJUT jwglxt timetable crawler"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "playwright==1.53.0",
+  "python-dotenv==1.0.1"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
