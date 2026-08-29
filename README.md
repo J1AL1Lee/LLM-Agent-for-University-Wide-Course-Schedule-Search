@@ -1,72 +1,97 @@
-# 教务系统课表抓取（BJUT jwglxt）
+# LLM Agent for University-Wide Course Schedule Search
 
-用于自动抓取 `https://jwglxt.bjut.edu.cn/` 班级课表，支持：
-- 抓包分析接口
-- 按条件批量导出班级课表 Excel
-- 按多个年级分目录导出
+A timetable crawler and local retrieval pipeline for Beijing University of Technology (BJUT). The project collects class schedules from the university's `jwglxt` academic administration system and turns the exported data into a searchable SQLite database and local vector index.
 
-## 1. 环境要求
-- Python 3.10+
-- Chromium（由 Playwright 安装）
+## Features
 
-## 2. 安装
-```bash
+- Inspect network requests used by the timetable search page.
+- Export all matching class schedules to Excel in configurable batches.
+- Organize exported schedules into separate directories by admission year.
+- Convert legacy `.xls` files into structured schedule records.
+- Build a local SQLite database and RAG-ready text corpus.
+- Create and query a Chinese-language vector index for natural-language schedule search.
+
+## Requirements
+
+- Python 3.10 or later
+- Chromium, installed through Playwright
+- Microsoft ACE OLE DB Provider on Windows when converting legacy `.xls` files
+
+## Installation
+
+```powershell
 python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
 python -m playwright install chromium
 ```
 
-## 3. 常用命令
+## Timetable Crawling
 
-### 3.1 抓包分析“班级课表查询”接口
-```bash
-python -m jiaowu_crawler --trace-network --trace-url "https://jwglxt.bjut.edu.cn/kbdy/bjkbdy_cxBjkbdyIndex.html?gnmkdm=N214505&layout=default" --output ./output
+### Inspect timetable network requests
+
+```powershell
+python -m jiaowu_crawler `
+  --trace-network `
+  --trace-url "https://jwglxt.bjut.edu.cn/kbdy/bjkbdy_cxBjkbdyIndex.html?gnmkdm=N214505&layout=default" `
+  --output .\output
 ```
 
-### 3.2 导出查询结果全部班级（每页 150 条）
-```bash
-python -m jiaowu_crawler \
-  --bj-export-all \
-  --xnm 2025 \
-  --xqm 12 \
-  --username YOUR_USERNAME \
-  --password "YOUR_PASSWORD" \
-  --output ./output
+### Export every class in the current query
+
+The crawler requests up to 150 records per page and exports every matching class:
+
+```powershell
+python -m jiaowu_crawler `
+  --bj-export-all `
+  --xnm 2025 `
+  --xqm 12 `
+  --username YOUR_USERNAME `
+  --password "YOUR_PASSWORD" `
+  --output .\output
 ```
 
-### 3.3 按多个年级分目录导出（推荐）
-```bash
-python -m jiaowu_crawler \
-  --bj-export-grades 2022,2023,2024,2025 \
-  --xnm 2025 \
-  --xqm 12 \
-  --username YOUR_USERNAME \
-  --password "YOUR_PASSWORD" \
-  --output ./output
+### Export schedules by admission year
+
+```powershell
+python -m jiaowu_crawler `
+  --bj-export-grades 2022,2023,2024,2025 `
+  --xnm 2025 `
+  --xqm 12 `
+  --username YOUR_USERNAME `
+  --password "YOUR_PASSWORD" `
+  --output .\output
 ```
 
-输出结构示例：
-- `output/2022/*.xls`
-- `output/2023/*.xls`
-- `output/2024/*.xls`
-- `output/2025/*.xls`
+Example output:
 
-## 4. 关键参数
-- `--xnm`：学年代码（如 `2025`）
-- `--xqm`：学期代码（如 `12`）
-- `--gnmkdm`：功能码（默认 `N214505`）
-- `--username/--password`：登录凭据
+```text
+output/
+├── 2022/
+├── 2023/
+├── 2024/
+└── 2025/
+```
 
-## 5. 调试文件
-- `output/bjkbdy_export_debug.log`：分页抓取调试日志
-- `output/bjkbdy_all_items.json`：查询到的全部条目
-- `output/network_trace.jsonl`：抓包明细
-- `output/network_trace_summary.md`：抓包汇总
+### Important arguments
 
-## 6. 重建课表 RAG 数据库
+- `--xnm`: academic year code, such as `2025`
+- `--xqm`: semester code, such as `12`
+- `--gnmkdm`: function code; defaults to `N214505`
+- `--username` and `--password`: university system credentials
 
-当前课表导出文件是旧版二进制 `.xls`。Windows 上可使用 Microsoft ACE OLE DB 将其转换为中间 CSV，再生成结构化 JSON、RAG 语料和 SQLite 数据库：
+### Debugging artifacts
+
+The crawler may produce the following files under `output/`:
+
+- `bjkbdy_export_debug.log`: pagination and export diagnostics
+- `bjkbdy_all_items.json`: all records returned by the timetable query
+- `network_trace.jsonl`: captured network request details
+- `network_trace_summary.md`: a readable network trace summary
+
+## Local Schedule Retrieval Pipeline
+
+The exported schedules use the legacy binary `.xls` format. On Windows, convert them to intermediate CSV files before generating the structured dataset, RAG corpus, and SQLite database:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\export_xls_to_csv.ps1
@@ -74,18 +99,22 @@ python .\scripts\build_schedule_corpus.py
 python .\scripts\load_schedule_to_sqlite.py
 ```
 
-默认只处理 `output/2023`、`output/2024`、`output/2025`、`output/2026`：
+By default, the scripts process `output/2023`, `output/2024`, `output/2025`, and `output/2026`.
 
-- `output/_schedule_csv/`：去重后的中间 CSV 和转换清单
-- `output/schedule_structured.json`：结构化课程数据
-- `output/schedule_rag_corpus.txt`：RAG 文本语料
-- `class_schedule.db`：SQLite 数据库
+Generated artifacts:
 
-Python 标准库已包含 `sqlite3`，不需要另行安装 SQLite 命令行工具。数据库构建会拒绝包含残缺课程字段的数据。
+- `output/_schedule_csv/`: deduplicated intermediate CSV files and conversion manifest
+- `output/schedule_structured.json`: structured schedule records
+- `output/schedule_rag_corpus.txt`: RAG text corpus
+- `class_schedule.db`: SQLite schedule database
 
-### 6.1 生成本地向量索引
+Python includes the `sqlite3` module, so the SQLite command-line application is not required. The database builder rejects records with incomplete course fields.
 
-向量检索使用 FastEmbed 和中文模型 `BAAI/bge-small-zh-v1.5`。首次运行会下载约 90 MB 的模型文件：
+## Vector Search
+
+Vector retrieval uses FastEmbed and the Chinese embedding model `BAAI/bge-small-zh-v1.5`. The first run downloads approximately 90 MB of model files.
+
+### Build the vector index
 
 ```powershell
 python -m venv .rag_venv
@@ -93,31 +122,36 @@ python -m venv .rag_venv
 .\.rag_venv\Scripts\python.exe .\scripts\build_vector_index.py
 ```
 
-生成结果位于 `output/vector_store/`：
+The vector store is written to `output/vector_store/`:
 
-- `schedule_embeddings.npy`：归一化后的 512 维课表向量
-- `schedule_ids.npy`：与 SQLite `courses.id` 对齐的记录 ID
-- `manifest.json`：模型、数据条数以及数据库/语料校验哈希
+- `schedule_embeddings.npy`: normalized 512-dimensional schedule embeddings
+- `schedule_ids.npy`: record IDs aligned with `courses.id` in SQLite
+- `manifest.json`: model metadata, record counts, and source-file hashes
 
-当 `class_schedule.db` 或 `schedule_rag_corpus.txt` 更新后，需要重新运行 `build_vector_index.py`。检索脚本会检查文件哈希，防止使用过期索引。
+Rebuild the index whenever `class_schedule.db` or `schedule_rag_corpus.txt` changes. The search command validates file hashes to prevent queries against a stale index.
 
-### 6.2 查询课表向量索引
+### Search the schedule index
 
 ```powershell
 .\.rag_venv\Scripts\python.exe .\scripts\search_schedule.py "230101班星期二第一二节有什么课"
 .\.rag_venv\Scripts\python.exe .\scripts\search_schedule.py "王晋茹老师给哪些班上高等数学" --top-k 10
 ```
 
-查询会自动识别班号、星期、节次和上午/下午，也支持显式过滤：
+The query parser recognizes class numbers, weekdays, periods, and time-of-day expressions. Filters can also be provided explicitly:
 
 ```powershell
 .\.rag_venv\Scripts\python.exe .\scripts\search_schedule.py "高等数学在哪里上课" `
-  --grade 2026 --weekday 星期五 --course-name 高等数学 --top-k 5
+  --grade 2026 `
+  --weekday 星期五 `
+  --course-name 高等数学 `
+  --top-k 5
 ```
 
-添加 `--json` 可输出适合后端接口消费的 JSON。
+Add `--json` to produce machine-readable output suitable for an API or agent backend.
 
-## 7. 安全与合规
-- 不要把账号密码写入代码或提交到仓库。
-- 建议优先通过环境变量或本地终端参数传入凭据。
-- 仅抓取你有权限访问的数据，并遵守学校系统使用规范及法律法规。
+## Security and Responsible Use
+
+- Never store university usernames or passwords in source code or commit them to Git.
+- Prefer environment variables or local command-line arguments for credentials.
+- Access only data you are authorized to use.
+- Follow university policies and all applicable laws and regulations.
