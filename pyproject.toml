@@ -13,6 +13,12 @@ dependencies = [
   "python-dotenv==1.0.1"
 ]
 
+[project.optional-dependencies]
+rag = [
+  "fastembed==0.8.0",
+  "numpy>=1.26,<3"
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
