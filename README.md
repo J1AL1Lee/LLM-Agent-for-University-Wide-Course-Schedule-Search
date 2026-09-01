@@ -149,6 +149,48 @@ The query parser recognizes class numbers, weekdays, periods, and time-of-day ex
 
 Add `--json` to produce machine-readable output suitable for an API or agent backend.
 
+## Dual-Lane RAG API
+
+The API keeps the deterministic local search path and adds a DeepSeek-assisted path:
+
+1. The direct lane parses obvious class, weekday, and period filters and searches the local vectors immediately.
+2. In parallel, DeepSeek rewrites the question and extracts additional structured filters; the rewritten query searches the same local index.
+3. The backend fuses both rankings with reciprocal rank fusion, then asks DeepSeek to answer only from the fused evidence.
+4. If the API key is absent, DeepSeek times out, or model output is invalid, the endpoint still returns local results and a deterministic summary.
+
+Install and configure the backend:
+
+```powershell
+.\.rag_venv\Scripts\python.exe -m pip install -r .\requirements-backend.txt
+Copy-Item .env.example .env
+# Edit .env and set DEEPSEEK_API_KEY. Never commit the real key.
+```
+
+Start it from the project root:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.rag_venv\Scripts\python.exe -m uvicorn jiaowu_rag.api:app --host 127.0.0.1 --port 8000
+```
+
+Open `http://127.0.0.1:8000/docs` for the interactive API page, or query it directly:
+
+```powershell
+$body = @{
+  question = "230101班星期二第一二节有什么课"
+  top_k = 5
+  use_deepseek = $true
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8000/v1/query `
+  -ContentType application/json `
+  -Body $body
+```
+
+`GET /health` reports the vector record count and whether DeepSeek is configured. Set `use_deepseek` to `false` on an individual request to force local-only retrieval.
+
 ## Security and Responsible Use
 
 - Never store university usernames or passwords in source code or commit them to Git.
