@@ -5,8 +5,9 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+import chromadb
 import numpy as np
 from fastembed import TextEmbedding
 
@@ -40,44 +41,53 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-class LocalScheduleRetriever:
-    """Load the existing dense index once and provide filtered cosine search."""
+class ChromaScheduleRetriever:
+    """Persistent ChromaDB retrieval with SQLite-backed schedule records."""
 
     def __init__(
         self,
         project_root: Path,
-        index_dir: Path | None = None,
+        persist_dir: Path | None = None,
+        collection_name: str | None = None,
         model_cache: Path | None = None,
         verify_hashes: bool = True,
     ) -> None:
         self.project_root = project_root.resolve()
-        self.index_dir = (index_dir or self.project_root / "output" / "vector_store").resolve()
+        self.persist_dir = (persist_dir or self.project_root / "output" / "chroma_db").resolve()
         self.model_cache = (model_cache or self.project_root / "output" / "model_cache").resolve()
-        manifest_path = self.index_dir / "manifest.json"
+        manifest_path = self.persist_dir / "manifest.json"
         if not manifest_path.exists():
-            raise FileNotFoundError(f"Vector index not found: {manifest_path}")
+            raise FileNotFoundError(
+                f"Chroma manifest not found: {manifest_path}. Run build_vector_index.py first."
+            )
         self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if self.manifest.get("storage") != "chromadb":
+            raise ValueError("The configured index is not a ChromaDB index; rebuild it")
+        self.collection_name = collection_name or str(self.manifest["collection"])
+        if self.collection_name != self.manifest["collection"]:
+            raise ValueError(
+                f"Chroma collection mismatch: configured={self.collection_name}, "
+                f"manifest={self.manifest['collection']}"
+            )
         self.db_path = (self.project_root / self.manifest["database"]).resolve()
         self.corpus_path = (self.project_root / self.manifest["corpus"]).resolve()
 
         if verify_hashes:
             if _sha256_file(self.db_path) != self.manifest["database_sha256"]:
-                raise ValueError("SQLite database changed after vectorization; rebuild the vector index")
+                raise ValueError("SQLite database changed after vectorization; rebuild the Chroma index")
             if _sha256_file(self.corpus_path) != self.manifest["corpus_sha256"]:
-                raise ValueError("RAG corpus changed after vectorization; rebuild the vector index")
+                raise ValueError("RAG corpus changed after vectorization; rebuild the Chroma index")
 
-        self.vectors = np.load(
-            self.index_dir / self.manifest["embeddings_file"], mmap_mode="r", allow_pickle=False
+        self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+        self.collection = self.client.get_collection(
+            name=self.collection_name,
+            embedding_function=None,
         )
-        self.vector_ids = np.load(
-            self.index_dir / self.manifest["ids_file"], mmap_mode="r", allow_pickle=False
-        )
-        self.documents = self.corpus_path.read_text(encoding="utf-8").splitlines()
-        expected_shape = (self.manifest["count"], self.manifest["dimensions"])
-        if self.vectors.shape != expected_shape:
-            raise ValueError(f"Vector file shape does not match manifest: {self.vectors.shape}")
-        if len(self.vector_ids) != len(self.documents) or len(self.vector_ids) != len(self.vectors):
-            raise ValueError("Vector IDs, documents, and embeddings are misaligned")
+        if self.collection.count() != int(self.manifest["count"]):
+            raise ValueError(
+                f"Chroma collection count does not match manifest: "
+                f"collection={self.collection.count()}, manifest={self.manifest['count']}"
+            )
         self.model = TextEmbedding(
             model_name=self.manifest["model"],
             cache_dir=str(self.model_cache),
@@ -86,11 +96,12 @@ class LocalScheduleRetriever:
 
     @property
     def count(self) -> int:
-        return int(self.manifest["count"])
+        return self.collection.count()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(f"file:{self.db_path.as_posix()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
         return connection
 
     def infer_filters(self, query: str, connection: sqlite3.Connection) -> SearchFilters:
@@ -113,26 +124,31 @@ class LocalScheduleRetriever:
         return SearchFilters(class_no=class_no, weekday=weekday, period=period, daytime=daytime)
 
     @staticmethod
-    def _eligible_ids(connection: sqlite3.Connection, filters: SearchFilters) -> np.ndarray | None:
-        clauses: list[str] = []
-        values: list[str] = []
-        data = filters.without_none()
-        column_map = {"period": "actual_period"}
-        for field in ("grade", "class_no", "weekday", "period", "daytime", "record_type"):
-            value = data.get(field)
-            if value:
-                clauses.append(f"{column_map.get(field, field)} = ?")
-                values.append(value)
-        if data.get("course_name"):
-            clauses.append("course_name LIKE ?")
-            values.append(f"%{data['course_name']}%")
-        if not clauses:
+    def _where(filters: SearchFilters) -> dict[str, Any] | None:
+        metadata_fields = {
+            "grade": "grade",
+            "class_no": "class_no",
+            "weekday": "weekday",
+            "period": "actual_period",
+            "daytime": "daytime",
+            "record_type": "record_type",
+            "course_name": "course_name",
+        }
+        conditions = [
+            {metadata_fields[field]: {"$eq": value}}
+            for field, value in filters.without_none().items()
+            if field in metadata_fields
+        ]
+        if not conditions:
             return None
-        sql = "SELECT id FROM courses WHERE " + " AND ".join(clauses)
-        return np.asarray([int(row[0]) for row in connection.execute(sql, values)], dtype=np.int64)
+        if len(conditions) == 1:
+            return conditions[0]
+        return {"$and": conditions}
 
     @staticmethod
-    def _fetch_records(connection: sqlite3.Connection, ids: list[int]) -> dict[int, dict[str, Any]]:
+    def _fetch_records(
+        connection: sqlite3.Connection, ids: list[int]
+    ) -> dict[int, dict[str, Any]]:
         if not ids:
             return {}
         placeholders = ",".join("?" for _ in ids)
@@ -146,6 +162,41 @@ class LocalScheduleRetriever:
             ids,
         ).fetchall()
         return {int(row["id"]): dict(row) for row in rows}
+
+    def fetch_courses(
+        self,
+        ids: list[int],
+        lane: Literal["vector", "sql"],
+    ) -> list[RetrievedCourse]:
+        unique_ids = list(dict.fromkeys(int(value) for value in ids))
+        if not unique_ids:
+            return []
+        stored = self.collection.get(ids=[str(value) for value in unique_ids], include=["documents"])
+        document_by_id = {
+            int(course_id): document
+            for course_id, document in zip(stored["ids"], stored.get("documents") or [])
+        }
+        connection = self._connect()
+        try:
+            records = self._fetch_records(connection, unique_ids)
+        finally:
+            connection.close()
+        courses = []
+        for rank, course_id in enumerate(unique_ids, start=1):
+            record = records.get(course_id)
+            document = document_by_id.get(course_id)
+            if record is None or document is None:
+                continue
+            courses.append(
+                RetrievedCourse(
+                    rank=rank,
+                    score=0.0,
+                    retrieval_lanes=[lane],
+                    document=document,
+                    **record,
+                )
+            )
+        return courses
 
     def search(
         self,
@@ -161,44 +212,48 @@ class LocalScheduleRetriever:
         try:
             inferred = self.infer_filters(query, connection) if auto_filter else SearchFilters()
             applied = explicit.merged_over(inferred)
-            allowed_ids = self._eligible_ids(connection, applied)
-            if allowed_ids is not None and len(allowed_ids) == 0:
-                return SearchBundle(query=query, filters=applied, results=[])
-
-            query_vector = np.asarray(list(self.model.query_embed(query))[0], dtype=np.float32)
-            norm = float(np.linalg.norm(query_vector))
-            if norm == 0:
-                raise ValueError("Embedding model produced a zero-length query vector")
-            query_vector /= norm
-            scores = np.asarray(self.vectors @ query_vector, dtype=np.float32)
-            if allowed_ids is not None:
-                mask = np.isin(self.vector_ids, allowed_ids, assume_unique=False)
-                scores[~mask] = -np.inf
-                available = int(mask.sum())
-            else:
-                available = len(scores)
-            result_count = min(top_k, available)
-            if result_count == 0:
-                return SearchBundle(query=query, filters=applied, results=[])
-            if result_count == len(scores):
-                positions = np.argsort(scores)[::-1]
-            else:
-                candidates = np.argpartition(scores, -result_count)[-result_count:]
-                positions = candidates[np.argsort(scores[candidates])[::-1]]
-            positions = positions[:result_count]
-            result_ids = [int(self.vector_ids[position]) for position in positions]
-            records = self._fetch_records(connection, result_ids)
-            results = []
-            for rank, position in enumerate(positions, start=1):
-                course_id = int(self.vector_ids[position])
-                results.append(
-                    RetrievedCourse(
-                        rank=rank,
-                        score=round(float(scores[position]), 6),
-                        document=self.documents[position],
-                        **records[course_id],
-                    )
-                )
-            return SearchBundle(query=query, filters=applied, results=results)
         finally:
             connection.close()
+
+        query_vector = np.asarray(list(self.model.query_embed(query))[0], dtype=np.float32)
+        norm = float(np.linalg.norm(query_vector))
+        if norm == 0:
+            raise ValueError("Embedding model produced a zero-length query vector")
+        query_vector /= norm
+
+        kwargs: dict[str, Any] = {
+            "query_embeddings": [query_vector.tolist()],
+            "n_results": min(top_k, self.count),
+            "include": ["documents", "distances"],
+        }
+        where = self._where(applied)
+        if where is not None:
+            kwargs["where"] = where
+        raw = self.collection.query(**kwargs)
+        ids = raw["ids"][0] if raw.get("ids") else []
+        documents = (raw.get("documents") or [[]])[0]
+        distances = (raw.get("distances") or [[]])[0]
+        result_ids = [int(value) for value in ids]
+
+        connection = self._connect()
+        try:
+            records = self._fetch_records(connection, result_ids)
+        finally:
+            connection.close()
+        results = []
+        for rank, (course_id, document, distance) in enumerate(
+            zip(result_ids, documents, distances), start=1
+        ):
+            record = records.get(course_id)
+            if record is None or document is None:
+                continue
+            results.append(
+                RetrievedCourse(
+                    rank=rank,
+                    score=round(1.0 - float(distance), 6),
+                    retrieval_lanes=["vector"],
+                    document=document,
+                    **record,
+                )
+            )
+        return SearchBundle(query=query, filters=applied, results=results)

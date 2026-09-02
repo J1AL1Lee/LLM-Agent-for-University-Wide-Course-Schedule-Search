@@ -9,7 +9,8 @@ A timetable crawler and local retrieval pipeline for Beijing University of Techn
 - Organize exported schedules into separate directories by admission year.
 - Convert legacy `.xls` files into structured schedule records.
 - Build a local SQLite database and RAG-ready text corpus.
-- Create and query a Chinese-language vector index for natural-language schedule search.
+- Store and query Chinese schedule embeddings in a persistent ChromaDB collection.
+- Route questions through a DeepSeek tool-calling loop between read-only Text-to-SQL and ChromaDB retrieval.
 
 ## Requirements
 
@@ -110,7 +111,7 @@ Generated artifacts:
 
 Python includes the `sqlite3` module, so the SQLite command-line application is not required. The database builder rejects records with incomplete course fields.
 
-## Vector Search
+## ChromaDB Vector Search
 
 Vector retrieval uses FastEmbed and the Chinese embedding model `BAAI/bge-small-zh-v1.5`. The first run downloads approximately 90 MB of model files.
 
@@ -122,13 +123,13 @@ python -m venv .rag_venv
 .\.rag_venv\Scripts\python.exe .\scripts\build_vector_index.py
 ```
 
-The vector store is written to `output/vector_store/`:
+The persistent vector store is written to `output/chroma_db/`:
 
-- `schedule_embeddings.npy`: normalized 512-dimensional schedule embeddings
-- `schedule_ids.npy`: record IDs aligned with `courses.id` in SQLite
-- `manifest.json`: model metadata, record counts, and source-file hashes
+- `chroma.sqlite3`: Chroma collection metadata and persisted records
+- a Chroma-managed segment directory containing the vector index
+- `manifest.json`: collection/model metadata, record counts, and source-file hashes
 
-Rebuild the index whenever `class_schedule.db` or `schedule_rag_corpus.txt` changes. The search command validates file hashes to prevent queries against a stale index.
+The `bjut_schedule` collection stores normalized 512-dimensional embeddings, documents, and filterable schedule metadata. Record IDs match `courses.id` in SQLite. Rebuild the collection whenever `class_schedule.db` or `schedule_rag_corpus.txt` changes; startup validates source hashes to prevent queries against stale data.
 
 ### Search the schedule index
 
@@ -149,14 +150,16 @@ The query parser recognizes class numbers, weekdays, periods, and time-of-day ex
 
 Add `--json` to produce machine-readable output suitable for an API or agent backend.
 
-## Dual-Lane RAG API
+## Text-to-SQL and Vector Tool-Calling API
 
-The API keeps the deterministic local search path and adds a DeepSeek-assisted path:
+When DeepSeek is configured, the API uses a native function-calling loop rather than a fixed retrieval pipeline:
 
-1. The direct lane parses obvious class, weekday, and period filters and searches the local vectors immediately.
-2. In parallel, DeepSeek rewrites the question and extracts additional structured filters; the rewritten query searches the same local index.
-3. The backend fuses both rankings with reciprocal rank fusion, then asks DeepSeek to answer only from the fused evidence.
-4. If the API key is absent, DeepSeek times out, or model output is invalid, the endpoint still returns local results and a deterministic summary.
+1. DeepSeek receives two function tools and must choose at least one before answering.
+2. `query_schedule_sql` is the Text-to-SQL tool for exact filtering, joins-free aggregation, counting, grouping, and comparison over the `courses` table.
+3. `search_schedule_vectors` performs semantic search in the persistent ChromaDB collection and accepts optional metadata filters.
+4. Tool results are returned to DeepSeek as `role=tool` messages. The model may call either tool again, call the other tool, or produce a grounded final answer.
+5. SQL executes through a read-only SQLite connection. Only one `SELECT` statement over `courses` is accepted; writes, other tables, comments, and multiple statements are rejected.
+6. If the API key is absent or the tool loop fails, the endpoint falls back to local ChromaDB retrieval and a deterministic summary.
 
 Install and configure the backend:
 
@@ -189,7 +192,27 @@ Invoke-RestMethod `
   -Body $body
 ```
 
-`GET /health` reports the vector record count and whether DeepSeek is configured. Set `use_deepseek` to `false` on an individual request to force local-only retrieval.
+`GET /health` reports the Chroma collection record count and whether DeepSeek is configured. Query responses use mode `tool_calling` when the loop succeeds and include a `tool_calls` trace. Set `use_deepseek` to `false` to force local-only ChromaDB retrieval.
+
+Relevant optional settings in `.env`:
+
+```dotenv
+RAG_CHROMA_DIR=output/chroma_db
+RAG_CHROMA_COLLECTION=bjut_schedule
+RAG_MAX_TOOL_ROUNDS=4
+RAG_MAX_CHAT_HISTORY_MESSAGES=20
+```
+
+### Multi-turn terminal agent
+
+The terminal agent uses the same read-only Text-to-SQL tool, ChromaDB retriever, and native DeepSeek tool-calling loop as the API. It retains recent user/assistant turns so follow-up questions such as “那周三呢” can reuse the preceding context:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.rag_venv\Scripts\python.exe .\scripts\chat_schedule_agent.py --show-tools
+```
+
+Enter `quit` or `exit` to stop. `RAG_MAX_CHAT_HISTORY_MESSAGES` limits the amount of conversation context sent on each turn. Exact class queries are instructed to search both `class_no` and `target_classes`; teacher queries use partial matching, and period values use the database's canonical `1-2节` form.
 
 ## Security and Responsible Use
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -30,19 +30,11 @@ class SearchFilters(BaseModel):
         return SearchFilters.model_validate({**fallback.without_none(), **self.without_none()})
 
 
-class QueryPlan(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    rewritten_query: str = Field(min_length=1, max_length=500)
-    filters: SearchFilters = Field(default_factory=SearchFilters)
-
-
 class RetrievedCourse(BaseModel):
     id: int
     rank: int
     score: float
-    fused_score: float = 0.0
-    retrieval_lanes: list[Literal["direct", "deepseek"]] = Field(default_factory=list)
+    retrieval_lanes: list[Literal["vector", "sql"]] = Field(default_factory=list)
     document: str
     semester: str
     grade: str
@@ -83,20 +75,34 @@ class QueryRequest(BaseModel):
 
 
 class QueryDiagnostics(BaseModel):
-    direct_ms: int
-    deepseek_plan_ms: int | None = None
-    assisted_retrieval_ms: int | None = None
-    deepseek_answer_ms: int | None = None
+    total_ms: int
+    local_vector_ms: int | None = None
+    tool_loop_ms: int | None = None
+    tool_rounds: int = 0
+
+
+class ToolCallRecord(BaseModel):
+    name: str
+    arguments: dict[str, Any]
+    result_count: int = 0
+    error: str | None = None
+
+
+class ToolLoopResult(BaseModel):
+    answer: str
+    courses: list[RetrievedCourse] = Field(default_factory=list)
+    calls: list[ToolCallRecord] = Field(default_factory=list)
+    rounds: int = 0
 
 
 class QueryResponse(BaseModel):
     question: str
     answer: str
-    mode: Literal["dual", "local_only"]
+    mode: Literal["tool_calling", "local_only"]
     deepseek_model: str | None = None
     applied_filters: SearchFilters
-    rewritten_query: str | None = None
     results: list[RetrievedCourse]
+    tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     diagnostics: QueryDiagnostics
 
