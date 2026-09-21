@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,6 +19,16 @@ from .models import (
 from .retriever import ChromaScheduleRetriever
 from .service import ToolCallingRAGService
 from .tools import ScheduleToolbox
+from .usage import UsageLedger
+
+
+def _configure_logging() -> None:
+    package_logger = logging.getLogger("jiaowu_rag")
+    if not package_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        package_logger.addHandler(handler)
+        package_logger.setLevel(logging.INFO)
 
 
 def create_app(
@@ -29,6 +40,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        _configure_logging()
         chroma_path = Path(configured_settings.chroma_dir)
         if not chroma_path.is_absolute():
             chroma_path = configured_settings.project_root / chroma_path
@@ -47,12 +59,17 @@ def create_app(
                 configured_settings,
                 ScheduleToolbox(active_retriever, max_results=configured_settings.max_top_k),
             )
+        ledger = UsageLedger(
+            configured_settings.resolve_path(configured_settings.usage_db),
+            configured_settings.daily_token_budget,
+        )
         app.state.rag_service = ToolCallingRAGService(
-            configured_settings, active_retriever, active_assistant
+            configured_settings, active_retriever, active_assistant, ledger
         )
         try:
             yield
         finally:
+            ledger.close()
             if active_assistant is not None:
                 await active_assistant.aclose()
 
@@ -82,6 +99,8 @@ def create_app(
             indexed_records=service.retriever.count,
             deepseek_configured=service.assistant is not None,
             deepseek_model=service.assistant.model_name if service.assistant else None,
+            tokens_used_today=service.ledger.tokens_used() if service.ledger else 0,
+            daily_token_budget=service.ledger.daily_token_budget if service.ledger else 0,
         )
 
     @app.post("/v1/query", response_model=QueryResponse)

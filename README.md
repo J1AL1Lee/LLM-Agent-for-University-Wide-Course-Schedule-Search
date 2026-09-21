@@ -211,7 +211,29 @@ RAG_CHROMA_COLLECTION=bjut_schedule
 RAG_MAX_TOOL_ROUNDS=4
 RAG_MAX_CHAT_HISTORY_MESSAGES=20
 RAG_SESSION_DB=output/sessions.sqlite
+RAG_USAGE_DB=output/usage.sqlite
+RAG_DAILY_TOKEN_BUDGET=3000000
+RAG_SEMESTER_START=
 ```
+
+### Dates and teaching weeks
+
+Each model call is told today's date in Beijing time, so questions such as “我明天有什么课” resolve to the right weekday. Set `RAG_SEMESTER_START` to the Monday of teaching week 1 (`YYYY-MM-DD`) to also give the model the current teaching week; otherwise it says the week is unknown and lists every week range.
+
+### Token usage and daily budget
+
+Every agent response reports `diagnostics.token_usage` (model calls, input, cached input, and output tokens), and each request is logged by the `jiaowu_rag.query` logger. Daily totals are stored in `RAG_USAGE_DB`, and `GET /health` shows `tokens_used_today` next to `daily_token_budget`. Once today's input plus output tokens reach `RAG_DAILY_TOKEN_BUDGET`, queries fall back to local ChromaDB retrieval, which uses no tokens, until midnight Beijing time. Set the budget to `0` to disable it. The budget applies to the whole service; per-user limits need authentication first.
+
+### Answer-quality evaluation
+
+`evals/schedule_questions.json` holds realistic questions (classes, teachers, rooms, counts, colloquial periods, semantic topics, empty results, SQL-injection attempts, follow-ups, and relative dates). Expected answers are computed from `class_schedule.db` by each case's `gold_sql`, so they stay correct when the timetable is rebuilt. The runner sends every question through the real agent and grades the answer:
+
+```powershell
+.\.rag_venv\Scripts\python.exe .\scripts\eval_agent.py
+.\.rag_venv\Scripts\python.exe .\scripts\eval_agent.py --only teacher multiturn
+```
+
+This calls DeepSeek and costs tokens (roughly $0.05 for the full set at peak prices). Results and a cost estimate are printed, and the full transcript is saved to `output/eval/report-*.json`. Evaluation sessions use `output/eval/eval_sessions.sqlite` and do not count toward the service's daily budget. Rerun it after changing prompts, tools, or the model.
 
 ### Multi-turn terminal agent
 
@@ -222,7 +244,7 @@ $env:PYTHONPATH = "src"
 .\.rag_venv\Scripts\python.exe .\scripts\chat_schedule_agent.py --show-tools
 ```
 
-Enter `quit` or `exit` to stop. `RAG_MAX_CHAT_HISTORY_MESSAGES` limits the amount of conversation context sent on each turn. Exact class queries are instructed to search both `class_no` and `target_classes`; teacher queries use partial matching, and period values use the database's canonical `1-2节` form.
+Enter `quit` or `exit` to stop. `RAG_MAX_CHAT_HISTORY_MESSAGES` limits the amount of conversation context sent on each turn. Exact class queries are instructed to search both `class_no` and `target_classes`; teacher queries match the full name exactly (so 孙艳 does not match 孙艳华), duplicate rows from combined classes are grouped, and period values use the database's canonical `1-2节` form.
 
 ## Security and Responsible Use
 

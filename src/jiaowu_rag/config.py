@@ -29,6 +29,9 @@ class Settings:
     max_tool_rounds: int = 4
     max_chat_history_messages: int = 20
     session_db: str = "output/sessions.sqlite"
+    usage_db: str = "output/usage.sqlite"
+    daily_token_budget: int = 3_000_000
+    semester_start: str | None = None
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "Settings":
@@ -51,4 +54,11 @@ class Settings:
                 os.getenv("RAG_MAX_CHAT_HISTORY_MESSAGES", "20")
             ),
             session_db=os.getenv("RAG_SESSION_DB", "output/sessions.sqlite").strip(),
+            usage_db=os.getenv("RAG_USAGE_DB", "output/usage.sqlite").strip(),
+            daily_token_budget=int(os.getenv("RAG_DAILY_TOKEN_BUDGET", "3000000")),
+            semester_start=os.getenv("RAG_SEMESTER_START", "").strip() or None,
         )
+
+    def resolve_path(self, value: str) -> Path:
+        path = Path(value)
+        return path if path.is_absolute() else self.project_root / path

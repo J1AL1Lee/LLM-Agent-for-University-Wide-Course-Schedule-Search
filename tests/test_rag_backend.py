@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
-
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -13,20 +14,36 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
-from jiaowu_rag.agent import LangChainScheduleAgent
+from jiaowu_rag.agent import LangChainScheduleAgent, date_note
 from jiaowu_rag.api import create_app
 from jiaowu_rag.config import Settings
-from jiaowu_rag.models import QueryRequest, SearchFilters, ToolCallRecord, ToolLoopResult
+from jiaowu_rag.models import (
+    QueryRequest,
+    SearchFilters,
+    TokenUsage,
+    ToolCallRecord,
+    ToolLoopResult,
+)
 from jiaowu_rag.retriever import ChromaScheduleRetriever
 from jiaowu_rag.service import ToolCallingRAGService
 from jiaowu_rag.tools import SQL_TOOL_NAME, VECTOR_TOOL_NAME, ScheduleToolbox
+from jiaowu_rag.usage import UsageLedger
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _tool_call(call_id: str, name: str, args: dict[str, Any]) -> AIMessage:
-    return AIMessage(content="", tool_calls=[{"id": call_id, "name": name, "args": args}])
+    return AIMessage(
+        content="",
+        tool_calls=[{"id": call_id, "name": name, "args": args}],
+        usage_metadata={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_token_details": {"cache_read": 40},
+        },
+    )
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -66,7 +83,13 @@ class FakeToolCallingAssistant:
         result_limit: int,
         required_filters: SearchFilters | None = None,
         session_id: str | None = None,
+        usage: TokenUsage | None = None,
     ) -> ToolLoopResult:
+        self.calls = getattr(self, "calls", 0) + 1
+        if usage is not None:
+            usage.model_calls += 2
+            usage.input_tokens += 1000
+            usage.output_tokens += 200
         toolbox = self.toolbox
         arguments = {
             "sql": (
@@ -97,14 +120,54 @@ class FakeToolCallingAssistant:
 class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
         cls.retriever = ChromaScheduleRetriever(PROJECT_ROOT)
         cls.settings = Settings(
             project_root=PROJECT_ROOT,
             deepseek_api_key=None,
             default_top_k=3,
             max_top_k=10,
+            usage_db=str(Path(cls._tmp.name) / "usage.sqlite"),
         )
         cls.toolbox = ScheduleToolbox(cls.retriever, max_results=10)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _ledger(self, budget: int) -> UsageLedger:
+        ledger = UsageLedger(Path(self._tmp.name) / f"ledger-{self.id()}.sqlite", budget)
+        self.addCleanup(ledger.close)
+        return ledger
+
+    def test_usage_ledger_tracks_daily_budget(self) -> None:
+        ledger = self._ledger(budget=1500)
+        self.assertFalse(ledger.budget_exhausted())
+        ledger.record(TokenUsage(model_calls=2, input_tokens=900, cached_input_tokens=400, output_tokens=100))
+        ledger.record(TokenUsage(model_calls=1, input_tokens=400, output_tokens=50), day="2000-01-01")
+        self.assertEqual(ledger.tokens_used(), 1000)
+        self.assertFalse(ledger.budget_exhausted())
+        ledger.record(TokenUsage(model_calls=1, input_tokens=500))
+        self.assertTrue(ledger.budget_exhausted())
+        self.assertFalse(self._ledger(budget=0).budget_exhausted())
+
+    async def test_service_records_usage_and_stops_at_budget(self) -> None:
+        assistant = FakeToolCallingAssistant(self.toolbox)
+        ledger = self._ledger(budget=1500)
+        service = ToolCallingRAGService(self.settings, self.retriever, assistant, ledger)
+        question = QueryRequest(question="230101班星期二第一二节有什么课")
+
+        first = await service.query(question)
+        self.assertEqual(first.mode, "tool_calling")
+        self.assertEqual(first.diagnostics.token_usage.total_tokens, 1200)
+        self.assertEqual(ledger.tokens_used(), 1200)
+
+        await service.query(question)
+        self.assertTrue(ledger.budget_exhausted())
+        third = await service.query(question)
+        self.assertEqual(third.mode, "local_only")
+        self.assertIn("额度", third.warnings[0])
+        self.assertEqual(assistant.calls, 2)
 
     def test_chroma_collection_is_loaded(self) -> None:
         self.assertEqual(self.retriever.manifest["storage"], "chromadb")
@@ -149,6 +212,23 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
                 {"sql": "SELECT id, load_extension('untrusted') FROM courses"},
                 3,
             )
+
+    def test_text_to_sql_tool_flags_truncated_results(self) -> None:
+        sql = "SELECT id FROM courses WHERE class_no='230101' ORDER BY id"
+        truncated = json.loads(self.toolbox.execute(SQL_TOOL_NAME, {"sql": sql, "max_rows": 3}, 3).content)
+        self.assertEqual(truncated["row_count"], 3)
+        self.assertTrue(truncated["truncated"])
+        complete = json.loads(
+            self.toolbox.execute(SQL_TOOL_NAME, {"sql": sql + " LIMIT 2", "max_rows": 3}, 3).content
+        )
+        self.assertNotIn("truncated", complete)
+
+    def test_date_note_resolves_weekday_and_teaching_week(self) -> None:
+        monday = date(2026, 9, 21)
+        self.assertIn("2026-09-21 星期一", date_note(monday, None))
+        self.assertIn("教学周未知", date_note(monday, None))
+        self.assertIn("第 3 教学周", date_note(monday, date(2026, 9, 7)))
+        self.assertIn("尚未开始", date_note(monday, date(2026, 9, 28)))
 
     def test_text_to_sql_tool_allows_safe_aggregation(self) -> None:
         result = self.toolbox.execute(
@@ -224,7 +304,11 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ),
                 _tool_call("call_vector_2", VECTOR_TOOL_NAME, {"query": "机器人相关课程", "top_k": 2}),
-                AIMessage(content="SQL 工具返回了两条课程记录 [id:1] [id:2]。"),
+                AIMessage(
+                    content="SQL 工具返回了两条课程记录 [id:1] [id:2]。",
+                    usage_metadata={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+                    response_metadata={"token_usage": {"prompt_cache_hit_tokens": 40}},
+                ),
                 _tool_call(
                     "call_sql_3",
                     SQL_TOOL_NAME,
@@ -233,7 +317,14 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
                 AIMessage(content="周三也有课。"),
             ]
         )
-        result = await agent.run("查询230101班的课程", result_limit=2, session_id="session-a1")
+        usage = TokenUsage()
+        result = await agent.run(
+            "查询230101班的课程", result_limit=2, session_id="session-a1", usage=usage
+        )
+        self.assertEqual(usage.model_calls, 3)
+        self.assertEqual(usage.input_tokens, 300)
+        self.assertEqual(usage.cached_input_tokens, 120)
+        self.assertEqual(usage.output_tokens, 60)
         self.assertEqual([call.name for call in result.calls], [SQL_TOOL_NAME, VECTOR_TOOL_NAME])
         self.assertTrue(all(call.error is None for call in result.calls))
         self.assertEqual(result.rounds, 2)

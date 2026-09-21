@@ -81,11 +81,23 @@ class QueryRequest(BaseModel):
         return value
 
 
+class TokenUsage(BaseModel):
+    model_calls: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
 class QueryDiagnostics(BaseModel):
     total_ms: int
     local_vector_ms: int | None = None
     tool_loop_ms: int | None = None
     tool_rounds: int = 0
+    token_usage: TokenUsage | None = None
 
 
 class ToolCallRecord(BaseModel):
@@ -121,6 +133,8 @@ class HealthResponse(BaseModel):
     indexed_records: int
     deepseek_configured: bool
     deepseek_model: str | None = None
+    tokens_used_today: int = 0
+    daily_token_budget: int = 0
 
 
 class SessionMessage(BaseModel):

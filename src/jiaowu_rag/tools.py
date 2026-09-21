@@ -61,8 +61,15 @@ class ScheduleToolbox:
                         "在只读 SQLite 课表库上执行 Text-to-SQL。适合精确筛选、计数、分组、"
                         "比较、教师/教室/班级等结构化问题。SQL 必须是单条 SELECT，只能读取 courses 表。"
                         "查询某班课程时必须使用 (class_no LIKE '%班号%' OR target_classes LIKE '%班号%')，"
-                        "不得在 course_name 中搜索班号；查询教师使用 teacher LIKE '%姓名%'；"
-                        "actual_period 使用 1-2节、3-4节等数字规范值；返回明细必须选择 id。"
+                        "不得在 course_name 中搜索班号；"
+                        "查询教师时按完整姓名精确匹配：(',' || teacher || ',') LIKE '%,姓名,%'"
+                        "（teacher 是逗号分隔的多位教师），只有用户给出的姓名不完整时才用 teacher LIKE '%片段%'，"
+                        "并在回答中区分返回的不同教师；"
+                        "actual_period 使用 1-2节、3-4节等数字规范值。"
+                        "合班课程会在每个班的课表中各出现一次，返回课程明细时必须去重："
+                        "SELECT MIN(id) AS id, course_name, weekday, actual_period, weeks, location, teacher "
+                        "... GROUP BY course_name, weekday, actual_period, weeks, location, teacher。"
+                        "结果带 truncated=true 时说明还有未返回的行，必须缩小条件或分组汇总后重查，不能据此断言“没有其他课”。"
                         "courses 字段：id, semester, grade, major, class_no, schedule_label, weekday, "
                         "daytime, period_original, actual_period, course_name, weeks, location, teacher, "
                         "course_code, target_classes, record_type, source_file。返回明细时务必选择 id。"
@@ -150,7 +157,8 @@ class ScheduleToolbox:
         if not isinstance(requested, int) or isinstance(requested, bool):
             raise ValueError("max_rows must be an integer")
         max_rows = min(max(1, requested), 20, request_limit, self.max_results)
-        bounded_sql = f"SELECT * FROM ({sql}) AS _tool_query LIMIT {max_rows}"
+        # Fetch one extra row so the model can be told the result was cut off.
+        bounded_sql = f"SELECT * FROM ({sql}) AS _tool_query LIMIT {max_rows + 1}"
 
         connection = sqlite3.connect(
             f"file:{self.retriever.db_path.as_posix()}?mode=ro", uri=True
@@ -187,6 +195,8 @@ class ScheduleToolbox:
             rows = [dict(row) for row in connection.execute(bounded_sql).fetchall()]
         finally:
             connection.close()
+        truncated = len(rows) > max_rows
+        rows = rows[:max_rows]
 
         course_ids = []
         for row in rows:
@@ -194,8 +204,14 @@ class ScheduleToolbox:
             if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
                 course_ids.append(int(value))
         courses = self.retriever.fetch_courses(course_ids, lane="sql")
+        payload: dict[str, Any] = {"sql": sql, "row_count": len(rows), "rows": rows}
+        if truncated:
+            payload["truncated"] = True
+            payload["note"] = (
+                f"结果超过 {max_rows} 行已被截断。请用 GROUP BY 去重、增加筛选条件或改用 COUNT 汇总后重新查询。"
+            )
         content = json.dumps(
-            {"sql": sql, "row_count": len(rows), "rows": rows},
+            payload,
             ensure_ascii=False,
             default=str,
         )
