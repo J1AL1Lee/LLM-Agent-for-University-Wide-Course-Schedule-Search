@@ -9,12 +9,15 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
+import chromadb
 import numpy as np
 from fastembed import TextEmbedding
 
 
 DEFAULT_MODEL = "BAAI/bge-small-zh-v1.5"
+DEFAULT_COLLECTION = "bjut_schedule"
 
 
 def sha256_file(path: Path) -> str:
@@ -25,29 +28,38 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_source_data(db_path: Path, corpus_path: Path) -> tuple[list[int], list[str], Counter[str]]:
+def load_source_data(
+    db_path: Path, corpus_path: Path
+) -> tuple[list[dict[str, Any]], list[str], Counter[str]]:
     documents = corpus_path.read_text(encoding="utf-8").splitlines()
-
     connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
     try:
-        rows = connection.execute("SELECT id, record_type FROM courses ORDER BY id").fetchall()
+        rows = connection.execute(
+            """
+            SELECT id, grade, class_no, weekday, daytime, actual_period,
+                   course_name, teacher, location, record_type
+            FROM courses ORDER BY id
+            """
+        ).fetchall()
     finally:
         connection.close()
 
-    ids = [int(row[0]) for row in rows]
-    record_types = Counter(str(row[1]) for row in rows)
-    if len(ids) != len(documents):
+    records = [dict(row) for row in rows]
+    if len(records) != len(documents):
         raise ValueError(
-            f"Database/corpus count mismatch: database={len(ids)}, corpus={len(documents)}. "
+            f"Database/corpus count mismatch: database={len(records)}, corpus={len(documents)}. "
             "Rebuild the structured corpus before vectorizing."
         )
-    if not ids:
+    if not records:
         raise ValueError("No schedule records found")
     if any(not document.strip() for document in documents):
         raise ValueError("Corpus contains empty documents")
+    ids = [int(record["id"]) for record in records]
     if len(ids) != len(set(ids)):
         raise ValueError("Database contains duplicate course IDs")
-    return ids, documents, record_types
+    record_types = Counter(str(record["record_type"]) for record in records)
+    return records, documents, record_types
 
 
 def normalize_rows(vectors: np.ndarray) -> np.ndarray:
@@ -57,19 +69,13 @@ def normalize_rows(vectors: np.ndarray) -> np.ndarray:
     return vectors / norms
 
 
-def save_npy_atomic(path: Path, array: np.ndarray) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    with temporary_path.open("wb") as file:
-        np.save(file, array, allow_pickle=False)
-    os.replace(temporary_path, path)
-
-
 def parse_args() -> argparse.Namespace:
     project_root = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Build a local dense-vector index for schedule RAG retrieval.")
+    parser = argparse.ArgumentParser(description="Build the persistent ChromaDB schedule index.")
     parser.add_argument("--db", type=Path, default=project_root / "class_schedule.db")
     parser.add_argument("--corpus", type=Path, default=project_root / "output" / "schedule_rag_corpus.txt")
-    parser.add_argument("--output-dir", type=Path, default=project_root / "output" / "vector_store")
+    parser.add_argument("--output-dir", type=Path, default=project_root / "output" / "chroma_db")
+    parser.add_argument("--collection", default=DEFAULT_COLLECTION)
     parser.add_argument("--model-cache", type=Path, default=project_root / "output" / "model_cache")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -80,6 +86,21 @@ def parse_args() -> argparse.Namespace:
         help="FastEmbed data-parallel workers; omit to use ONNX Runtime threading.",
     )
     return parser.parse_args()
+
+
+def _metadata(record: dict[str, Any]) -> dict[str, str | int]:
+    return {
+        "course_id": int(record["id"]),
+        "grade": str(record.get("grade") or ""),
+        "class_no": str(record.get("class_no") or ""),
+        "weekday": str(record.get("weekday") or ""),
+        "daytime": str(record.get("daytime") or ""),
+        "actual_period": str(record.get("actual_period") or ""),
+        "course_name": str(record.get("course_name") or ""),
+        "teacher": str(record.get("teacher") or ""),
+        "location": str(record.get("location") or ""),
+        "record_type": str(record.get("record_type") or ""),
+    }
 
 
 def main() -> None:
@@ -98,62 +119,95 @@ def main() -> None:
     if not corpus_path.exists():
         raise FileNotFoundError(f"RAG corpus not found: {corpus_path}")
 
-    ids, documents, record_types = load_source_data(db_path, corpus_path)
+    records, documents, record_types = load_source_data(db_path, corpus_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_cache.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading embedding model: {args.model}")
-    model = TextEmbedding(model_name=args.model, cache_dir=str(model_cache))
-    print(f"Embedding documents: {len(documents)}")
-    vectors = np.asarray(
-        list(
-            model.passage_embed(
-                documents,
-                batch_size=args.batch_size,
-                parallel=args.parallel,
-            )
-        ),
-        dtype=np.float32,
+    model = TextEmbedding(
+        model_name=args.model,
+        cache_dir=str(model_cache),
+        local_files_only=True,
+    )
+    client = chromadb.PersistentClient(path=str(output_dir))
+    existing = {item.name for item in client.list_collections()}
+    if args.collection in existing:
+        print(f"Replacing Chroma collection: {args.collection}")
+        client.delete_collection(args.collection)
+    collection = client.create_collection(
+        name=args.collection,
+        embedding_function=None,
+        metadata={
+            "hnsw:space": "cosine",
+            "embedding_model": args.model,
+            "description": "BJUT class schedule records",
+        },
     )
 
-    if vectors.ndim != 2 or vectors.shape[0] != len(documents):
-        raise ValueError(f"Unexpected embedding shape: {vectors.shape}")
-    if not np.isfinite(vectors).all():
-        raise ValueError("Embeddings contain non-finite values")
-    vectors = normalize_rows(vectors).astype(np.float32, copy=False)
-    id_array = np.asarray(ids, dtype=np.int64)
+    print(f"Embedding and inserting documents into ChromaDB: {len(documents)}")
+    dimensions: int | None = None
+    for start in range(0, len(documents), args.batch_size):
+        end = min(start + args.batch_size, len(documents))
+        batch_documents = documents[start:end]
+        vectors = np.asarray(
+            list(
+                model.passage_embed(
+                    batch_documents,
+                    batch_size=args.batch_size,
+                    parallel=args.parallel,
+                )
+            ),
+            dtype=np.float32,
+        )
+        if vectors.ndim != 2 or vectors.shape[0] != len(batch_documents):
+            raise ValueError(f"Unexpected embedding shape: {vectors.shape}")
+        if not np.isfinite(vectors).all():
+            raise ValueError("Embeddings contain non-finite values")
+        vectors = normalize_rows(vectors).astype(np.float32, copy=False)
+        dimensions = dimensions or int(vectors.shape[1])
+        if vectors.shape[1] != dimensions:
+            raise ValueError("Embedding dimensions changed while building the collection")
 
-    embeddings_path = output_dir / "schedule_embeddings.npy"
-    ids_path = output_dir / "schedule_ids.npy"
-    manifest_path = output_dir / "manifest.json"
-    save_npy_atomic(embeddings_path, vectors)
-    save_npy_atomic(ids_path, id_array)
+        batch_records = records[start:end]
+        collection.add(
+            ids=[str(record["id"]) for record in batch_records],
+            embeddings=vectors.tolist(),
+            documents=batch_documents,
+            metadatas=[_metadata(record) for record in batch_records],
+        )
+        print(f"Inserted {end}/{len(documents)}")
+
+    if collection.count() != len(documents) or dimensions is None:
+        raise ValueError(
+            f"Chroma collection count mismatch: expected={len(documents)}, actual={collection.count()}"
+        )
 
     project_root = Path(__file__).resolve().parents[1]
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
+        "storage": "chromadb",
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "collection": args.collection,
         "model": args.model,
-        "dimensions": int(vectors.shape[1]),
-        "count": int(vectors.shape[0]),
-        "dtype": str(vectors.dtype),
+        "dimensions": dimensions,
+        "count": collection.count(),
         "normalized": True,
-        "similarity": "cosine_via_dot_product",
+        "similarity": "cosine",
         "embedding_method": "passage_embed",
         "database": os.path.relpath(db_path, project_root).replace("\\", "/"),
         "database_sha256": sha256_file(db_path),
         "corpus": os.path.relpath(corpus_path, project_root).replace("\\", "/"),
         "corpus_sha256": sha256_file(corpus_path),
-        "embeddings_file": embeddings_path.name,
-        "ids_file": ids_path.name,
         "record_types": dict(sorted(record_types.items())),
     }
+    manifest_path = output_dir / "manifest.json"
     temporary_manifest = manifest_path.with_name(manifest_path.name + ".tmp")
     temporary_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary_manifest, manifest_path)
 
-    print(f"Vector index: {embeddings_path}")
-    print(f"Shape: {vectors.shape[0]} x {vectors.shape[1]}")
+    print(f"ChromaDB: {output_dir}")
+    print(f"Collection: {args.collection}")
+    print(f"Records: {collection.count()} x {dimensions}")
     print(f"Manifest: {manifest_path}")
 
 
