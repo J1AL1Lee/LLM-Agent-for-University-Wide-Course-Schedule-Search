@@ -28,6 +28,7 @@ class Settings:
     chroma_collection: str = "bjut_schedule"
     max_tool_rounds: int = 4
     max_chat_history_messages: int = 20
+    session_db: str = "output/sessions.sqlite"
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "Settings":
@@ -49,4 +50,5 @@ class Settings:
             max_chat_history_messages=int(
                 os.getenv("RAG_MAX_CHAT_HISTORY_MESSAGES", "20")
             ),
+            session_db=os.getenv("RAG_SESSION_DB", "output/sessions.sqlite").strip(),
         )

@@ -3,20 +3,27 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Path as PathParam, Request, Response
 from fastapi.responses import RedirectResponse
 
+from .agent import LangChainScheduleAgent, ScheduleAgent
 from .config import Settings
-from .deepseek import DeepSeekToolCallingAssistant
-from .models import HealthResponse, QueryRequest, QueryResponse
+from .models import (
+    SESSION_ID_PATTERN,
+    HealthResponse,
+    QueryRequest,
+    QueryResponse,
+    SessionHistoryResponse,
+)
 from .retriever import ChromaScheduleRetriever
 from .service import ToolCallingRAGService
+from .tools import ScheduleToolbox
 
 
 def create_app(
     settings: Settings | None = None,
     retriever: ChromaScheduleRetriever | None = None,
-    assistant: DeepSeekToolCallingAssistant | None = None,
+    assistant: ScheduleAgent | None = None,
 ) -> FastAPI:
     configured_settings = settings or Settings.from_env()
 
@@ -36,7 +43,10 @@ def create_app(
             and configured_settings.deepseek_enabled
             and configured_settings.deepseek_api_key
         ):
-            active_assistant = DeepSeekToolCallingAssistant(configured_settings)
+            active_assistant = await LangChainScheduleAgent.create(
+                configured_settings,
+                ScheduleToolbox(active_retriever, max_results=configured_settings.max_top_k),
+            )
         app.state.rag_service = ToolCallingRAGService(
             configured_settings, active_retriever, active_assistant
         )
@@ -49,7 +59,10 @@ def create_app(
     app = FastAPI(
         title="BJUT Schedule Tool-Calling RAG API",
         version="1.0.0",
-        description="DeepSeek tool routing between read-only Text-to-SQL and ChromaDB retrieval.",
+        description=(
+            "LangChain agent routing between read-only Text-to-SQL and ChromaDB retrieval, "
+            "with conversations persisted per session_id."
+        ),
         lifespan=lifespan,
     )
 
@@ -78,6 +91,30 @@ def create_app(
             return await service.query(payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    session_id_param = PathParam(pattern=SESSION_ID_PATTERN)
+
+    @app.get("/v1/sessions/{session_id}", response_model=SessionHistoryResponse)
+    async def session_history(
+        request: Request, session_id: str = session_id_param
+    ) -> SessionHistoryResponse:
+        service: ToolCallingRAGService = request.app.state.rag_service
+        try:
+            messages = await service.get_session_history(session_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if messages is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return SessionHistoryResponse(session_id=session_id, messages=messages)
+
+    @app.delete("/v1/sessions/{session_id}", status_code=204)
+    async def delete_session(request: Request, session_id: str = session_id_param) -> Response:
+        service: ToolCallingRAGService = request.app.state.rag_service
+        try:
+            await service.delete_session(session_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return Response(status_code=204)
 
     return app
 

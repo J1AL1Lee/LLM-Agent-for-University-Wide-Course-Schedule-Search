@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
+import uuid
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from jiaowu_rag.agent import LangChainScheduleAgent  # noqa: E402
 from jiaowu_rag.config import Settings  # noqa: E402
-from jiaowu_rag.deepseek import DeepSeekToolCallingAssistant  # noqa: E402
+from jiaowu_rag.models import SESSION_ID_PATTERN  # noqa: E402
 from jiaowu_rag.retriever import ChromaScheduleRetriever  # noqa: E402
 from jiaowu_rag.tools import ScheduleToolbox  # noqa: E402
 
@@ -24,6 +27,11 @@ def parse_args() -> argparse.Namespace:
         "--show-tools",
         action="store_true",
         help="Print each tool name, result count, and error after an answer.",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="Resume a persisted session ID; a new one is generated when omitted.",
     )
     return parser.parse_args()
 
@@ -40,6 +48,10 @@ async def run_chat(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    session_id = args.session or uuid.uuid4().hex
+    if not re.fullmatch(SESSION_ID_PATTERN, session_id):
+        print("错误：--session 只能包含字母、数字、_ 和 -，长度 8 到 128。", file=sys.stderr)
+        return 2
 
     chroma_dir = Path(settings.chroma_dir)
     if not chroma_dir.is_absolute():
@@ -50,14 +62,14 @@ async def run_chat(args: argparse.Namespace) -> int:
         collection_name=settings.chroma_collection,
     )
     toolbox = ScheduleToolbox(retriever, max_results=settings.max_top_k)
-    assistant = DeepSeekToolCallingAssistant(settings)
-    history: list[dict[str, str]] = []
+    assistant = await LangChainScheduleAgent.create(settings, toolbox)
 
     print("教务 Agent 已启动。输入 quit 或 exit 退出，Ctrl+C 也可结束。")
     print(
         f"Chroma collection={retriever.collection_name}，records={retriever.count}，"
         f"model={assistant.model_name}"
     )
+    print(f"session={session_id}（下次用 --session {session_id} 继续本会话）")
     try:
         while True:
             try:
@@ -74,9 +86,8 @@ async def run_chat(args: argparse.Namespace) -> int:
             try:
                 outcome = await assistant.run(
                     user_input,
-                    toolbox,
                     result_limit=top_k,
-                    conversation_history=history,
+                    session_id=session_id,
                 )
             except Exception as exc:
                 print(f"Agent 调用失败：{type(exc).__name__}: {exc}", file=sys.stderr)
@@ -89,17 +100,6 @@ async def run_chat(args: argparse.Namespace) -> int:
                     print(
                         f"  tool[{index}] {call.name} results={call.result_count}{suffix}"
                     )
-
-            history.extend(
-                [
-                    {"role": "user", "content": user_input},
-                    {"role": "assistant", "content": outcome.answer},
-                ]
-            )
-            if settings.max_chat_history_messages:
-                history = history[-settings.max_chat_history_messages :]
-            else:
-                history.clear()
     finally:
         await assistant.aclose()
     return 0

@@ -10,7 +10,7 @@ A timetable crawler and local retrieval pipeline for Beijing University of Techn
 - Convert legacy `.xls` files into structured schedule records.
 - Build a local SQLite database and RAG-ready text corpus.
 - Store and query Chinese schedule embeddings in a persistent ChromaDB collection.
-- Route questions through a DeepSeek tool-calling loop between read-only Text-to-SQL and ChromaDB retrieval.
+- Route questions through a LangChain agent (DeepSeek model) between read-only Text-to-SQL and ChromaDB retrieval, with conversations persisted per session ID.
 
 ## Requirements
 
@@ -152,13 +152,13 @@ Add `--json` to produce machine-readable output suitable for an API or agent bac
 
 ## Text-to-SQL and Vector Tool-Calling API
 
-When DeepSeek is configured, the API uses a native function-calling loop rather than a fixed retrieval pipeline:
+When DeepSeek is configured, the API runs a LangChain agent (`langchain.agents.create_agent` with `ChatDeepSeek`) rather than a fixed retrieval pipeline:
 
-1. DeepSeek receives two function tools and must choose at least one before answering.
+1. The model receives two tools and must call at least one before answering (`tool_choice=required` on the first round of every turn).
 2. `query_schedule_sql` is the Text-to-SQL tool for exact filtering, joins-free aggregation, counting, grouping, and comparison over the `courses` table.
 3. `search_schedule_vectors` performs semantic search in the persistent ChromaDB collection and accepts optional metadata filters.
-4. Tool results are returned to DeepSeek as `role=tool` messages. The model may call either tool again, call the other tool, or produce a grounded final answer.
-5. SQL executes through a read-only SQLite connection. Only one `SELECT` statement over `courses` is accepted; writes, other tables, comments, and multiple statements are rejected.
+4. Tool results are returned to the model as tool messages. It may call either tool again, call the other tool, or produce a grounded final answer. After `RAG_MAX_TOOL_ROUNDS` rounds the model is called without tools for its final answer.
+5. SQL executes through a read-only SQLite connection. Only one `SELECT` statement over `courses` is accepted; writes, other tables, comments, and multiple statements are rejected. The LangChain tools are thin wrappers over `ScheduleToolbox`, so this validation and the BGE/Chroma index are shared by the API, the terminal agent, and the tests.
 6. If the API key is absent or the tool loop fails, the endpoint falls back to local ChromaDB retrieval and a deterministic summary.
 
 Install and configure the backend:
@@ -194,6 +194,15 @@ Invoke-RestMethod `
 
 `GET /health` reports the Chroma collection record count and whether DeepSeek is configured. Query responses use mode `tool_calling` when the loop succeeds and include a `tool_calls` trace. Set `use_deepseek` to `false` to force local-only ChromaDB retrieval.
 
+### Sessions
+
+Every agent response includes a `session_id`. Send it back in the next `/v1/query` body to continue the conversation; omit it to start a new one. Conversations are checkpointed by LangGraph into the SQLite file at `RAG_SESSION_DB` and survive restarts. Earlier turns are sent to the model as question/answer text only (the last `RAG_MAX_CHAT_HISTORY_MESSAGES` messages); their tool calls and results are not replayed.
+
+- `GET /v1/sessions/{session_id}` returns the stored user/assistant messages (404 if unknown).
+- `DELETE /v1/sessions/{session_id}` deletes the session.
+
+Session IDs must match `^[A-Za-z0-9_-]{8,128}$`. The API has no authentication or rate limiting yet, so a session ID is effectively a bearer secret: anyone who has it can read or delete that conversation. Add authentication and rate limiting before exposing the service publicly.
+
 Relevant optional settings in `.env`:
 
 ```dotenv
@@ -201,11 +210,12 @@ RAG_CHROMA_DIR=output/chroma_db
 RAG_CHROMA_COLLECTION=bjut_schedule
 RAG_MAX_TOOL_ROUNDS=4
 RAG_MAX_CHAT_HISTORY_MESSAGES=20
+RAG_SESSION_DB=output/sessions.sqlite
 ```
 
 ### Multi-turn terminal agent
 
-The terminal agent uses the same read-only Text-to-SQL tool, ChromaDB retriever, and native DeepSeek tool-calling loop as the API. It retains recent user/assistant turns so follow-up questions such as “那周三呢” can reuse the preceding context:
+The terminal agent uses the same LangChain agent, read-only Text-to-SQL tool, ChromaDB retriever, and session store as the API, so follow-up questions such as “那周三呢” can reuse the preceding context. It prints its session ID at startup; pass `--session <id>` to resume that conversation later:
 
 ```powershell
 $env:PYTHONPATH = "src"

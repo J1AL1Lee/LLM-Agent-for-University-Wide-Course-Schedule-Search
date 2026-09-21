@@ -5,6 +5,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{8,128}$"
+
 class SearchFilters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -64,6 +66,11 @@ class QueryRequest(BaseModel):
     top_k: int | None = Field(default=None, ge=1, le=100)
     use_deepseek: bool = True
     filters: SearchFilters = Field(default_factory=SearchFilters)
+    session_id: str | None = Field(
+        default=None,
+        pattern=SESSION_ID_PATTERN,
+        description="Continue an existing conversation; omit to start a new one.",
+    )
 
     @field_validator("question")
     @classmethod
@@ -97,6 +104,7 @@ class ToolLoopResult(BaseModel):
 
 class QueryResponse(BaseModel):
     question: str
+    session_id: str | None = None
     answer: str
     mode: Literal["tool_calling", "local_only"]
     deepseek_model: str | None = None
@@ -113,3 +121,13 @@ class HealthResponse(BaseModel):
     indexed_records: int
     deepseek_configured: bool
     deepseek_model: str | None = None
+
+
+class SessionMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class SessionHistoryResponse(BaseModel):
+    session_id: str
+    messages: list[SessionMessage]

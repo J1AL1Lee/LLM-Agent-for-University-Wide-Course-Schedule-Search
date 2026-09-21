@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 
+from .agent import ScheduleAgent
 from .config import Settings
-from .deepseek import DeepSeekAssistant
 from .models import (
     QueryDiagnostics,
     QueryRequest,
     QueryResponse,
     RetrievedCourse,
     SearchFilters,
+    SessionMessage,
     ToolCallRecord,
 )
 from .retriever import ChromaScheduleRetriever
-from .tools import ScheduleToolbox
 
 
 def _elapsed_ms(start: float) -> int:
@@ -53,12 +54,11 @@ class ToolCallingRAGService:
         self,
         settings: Settings,
         retriever: ChromaScheduleRetriever,
-        assistant: DeepSeekAssistant | None = None,
+        assistant: ScheduleAgent | None = None,
     ) -> None:
         self.settings = settings
         self.retriever = retriever
         self.assistant = assistant
-        self.toolbox = ScheduleToolbox(retriever, max_results=settings.max_top_k)
 
     async def _local_query(
         self, request: QueryRequest, top_k: int
@@ -81,15 +81,17 @@ class ToolCallingRAGService:
         tool_loop_ms: int | None = None
         local_vector_ms: int | None = None
         tool_rounds = 0
+        session_id = request.session_id
 
         if request.use_deepseek and self.assistant is not None:
+            session_id = session_id or uuid.uuid4().hex
             tool_start = time.perf_counter()
             try:
                 outcome = await self.assistant.run(
                     request.question,
-                    self.toolbox,
                     top_k,
                     request.filters,
+                    session_id,
                 )
                 tool_loop_ms = _elapsed_ms(tool_start)
                 tool_calls = outcome.calls
@@ -97,6 +99,7 @@ class ToolCallingRAGService:
                 results = _normalize_ranks(outcome.courses, top_k)
                 return QueryResponse(
                     question=request.question,
+                    session_id=session_id,
                     answer=outcome.answer,
                     mode="tool_calling",
                     deepseek_model=self.assistant.model_name,
@@ -113,7 +116,8 @@ class ToolCallingRAGService:
             except Exception as exc:
                 tool_loop_ms = _elapsed_ms(tool_start)
                 warnings.append(
-                    f"DeepSeek 工具调用循环失败，已降级为 ChromaDB 本地检索：{type(exc).__name__}"
+                    f"LangChain 工具调用循环失败，已降级为 ChromaDB 本地检索：{type(exc).__name__}"
+                    "（本轮回答未写入会话历史）"
                 )
         elif request.use_deepseek:
             warnings.append("DeepSeek 未配置，已降级为 ChromaDB 本地检索。")
@@ -122,6 +126,7 @@ class ToolCallingRAGService:
         results = _normalize_ranks(results, top_k)
         return QueryResponse(
             question=request.question,
+            session_id=session_id,
             answer=_local_answer(results),
             mode="local_only",
             deepseek_model=None,
@@ -136,3 +141,14 @@ class ToolCallingRAGService:
                 tool_rounds=tool_rounds,
             ),
         )
+
+    def _require_sessions(self) -> ScheduleAgent:
+        if self.assistant is None:
+            raise LookupError("Sessions require a configured DeepSeek agent")
+        return self.assistant
+
+    async def get_session_history(self, session_id: str) -> list[SessionMessage] | None:
+        return await self._require_sessions().get_history(session_id)
+
+    async def delete_session(self, session_id: str) -> None:
+        await self._require_sessions().delete_session(session_id)

@@ -5,12 +5,17 @@ import sqlite3
 import unittest
 from pathlib import Path
 
-import httpx
-from fastapi.testclient import TestClient
+from typing import Any
 
+from fastapi.testclient import TestClient
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langgraph.checkpoint.memory import InMemorySaver
+
+from jiaowu_rag.agent import LangChainScheduleAgent
 from jiaowu_rag.api import create_app
 from jiaowu_rag.config import Settings
-from jiaowu_rag.deepseek import DeepSeekToolCallingAssistant
 from jiaowu_rag.models import QueryRequest, SearchFilters, ToolCallRecord, ToolLoopResult
 from jiaowu_rag.retriever import ChromaScheduleRetriever
 from jiaowu_rag.service import ToolCallingRAGService
@@ -20,16 +25,49 @@ from jiaowu_rag.tools import SQL_TOOL_NAME, VECTOR_TOOL_NAME, ScheduleToolbox
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _tool_call(call_id: str, name: str, args: dict[str, Any]) -> AIMessage:
+    return AIMessage(content="", tool_calls=[{"id": call_id, "name": name, "args": args}])
+
+
+class ScriptedChatModel(BaseChatModel):
+    """Replays scripted AI messages and records what each model call received."""
+
+    script: list[AIMessage]
+    seen: list[dict[str, Any]] = []
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted"
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        return self.bind(tool_names=[tool.name for tool in tools], tool_choice=tool_choice)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        self.seen.append(
+            {
+                "roles": [message.type for message in messages],
+                "messages": [message.text for message in messages],
+                "tool_names": kwargs.get("tool_names"),
+                "tool_choice": kwargs.get("tool_choice"),
+            }
+        )
+        return ChatResult(generations=[ChatGeneration(message=self.script.pop(0))])
+
+
 class FakeToolCallingAssistant:
     model_name = "fake-deepseek"
+
+    def __init__(self, toolbox: ScheduleToolbox) -> None:
+        self.toolbox = toolbox
 
     async def run(
         self,
         question: str,
-        toolbox: ScheduleToolbox,
         result_limit: int,
         required_filters: SearchFilters | None = None,
+        session_id: str | None = None,
     ) -> ToolLoopResult:
+        toolbox = self.toolbox
         arguments = {
             "sql": (
                 "SELECT id, class_no, weekday, actual_period, course_name, teacher, location "
@@ -150,7 +188,7 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_service_uses_tool_calling_result(self) -> None:
         service = ToolCallingRAGService(
-            self.settings, self.retriever, assistant=FakeToolCallingAssistant()
+            self.settings, self.retriever, assistant=FakeToolCallingAssistant(self.toolbox)
         )
         response = await service.query(QueryRequest(question="230101班星期二第一二节有什么课"))
         self.assertEqual(response.mode, "tool_calling")
@@ -158,136 +196,133 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.tool_calls[0].name, SQL_TOOL_NAME)
         self.assertTrue(response.results)
         self.assertEqual(response.results[0].retrieval_lanes, ["sql"])
+        self.assertTrue(response.session_id)
 
-    async def test_deepseek_loop_sends_tools_and_tool_results(self) -> None:
+    def _agent(
+        self, script: list[AIMessage], max_tool_rounds: int = 3
+    ) -> tuple[LangChainScheduleAgent, ScriptedChatModel]:
         settings = Settings(
             project_root=PROJECT_ROOT,
-            deepseek_api_key="test-key",
-            max_tool_rounds=3,
+            deepseek_api_key=None,
+            max_tool_rounds=max_tool_rounds,
         )
-        assistant = DeepSeekToolCallingAssistant(settings)
-        await assistant.aclose()
-        request_count = 0
-
-        async def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal request_count
-            request_count += 1
-            payload = json.loads(request.content)
-            self.assertEqual(request.url.path, "/chat/completions")
-            self.assertEqual(payload["model"], "deepseek-v4-flash")
-            if request_count == 1:
-                self.assertEqual(payload["tool_choice"], "required")
-                self.assertEqual(
-                    [message["role"] for message in payload["messages"][:4]],
-                    ["system", "user", "assistant", "user"],
-                )
-                self.assertEqual(payload["messages"][1]["content"], "上次查的是230101班。")
-                self.assertEqual(payload["messages"][2]["content"], "已记录这个班级。")
-                tool_names = {item["function"]["name"] for item in payload["tools"]}
-                self.assertEqual(tool_names, {SQL_TOOL_NAME, VECTOR_TOOL_NAME})
-                return httpx.Response(
-                    200,
-                    json={
-                        "choices": [
-                            {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": None,
-                                    "tool_calls": [
-                                        {
-                                            "id": "call_sql_1",
-                                            "type": "function",
-                                            "function": {
-                                                "name": SQL_TOOL_NAME,
-                                                "arguments": json.dumps(
-                                                    {
-                                                        "sql": (
-                                                            "SELECT id, course_name FROM courses "
-                                                            "WHERE class_no='230101' ORDER BY id"
-                                                        ),
-                                                        "max_rows": 2,
-                                                    },
-                                                    ensure_ascii=False,
-                                                ),
-                                            },
-                                        }
-                                    ],
-                                }
-                            }
-                        ]
-                    },
-                )
-            self.assertEqual(payload["tool_choice"], "auto")
-            tool_messages = [item for item in payload["messages"] if item["role"] == "tool"]
-            if request_count == 2:
-                self.assertEqual(len(tool_messages), 1)
-                self.assertEqual(tool_messages[0]["tool_call_id"], "call_sql_1")
-                self.assertIn("row_count", tool_messages[0]["content"])
-                return httpx.Response(
-                    200,
-                    json={
-                        "choices": [
-                            {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": None,
-                                    "tool_calls": [
-                                        {
-                                            "id": "call_vector_2",
-                                            "type": "function",
-                                            "function": {
-                                                "name": VECTOR_TOOL_NAME,
-                                                "arguments": json.dumps(
-                                                    {"query": "机器人相关课程", "top_k": 2},
-                                                    ensure_ascii=False,
-                                                ),
-                                            },
-                                        }
-                                    ],
-                                }
-                            }
-                        ]
-                    },
-                )
-            self.assertEqual(len(tool_messages), 2)
-            self.assertEqual(tool_messages[1]["tool_call_id"], "call_vector_2")
-            self.assertIn("match_count", tool_messages[1]["content"])
-            return httpx.Response(
-                200,
-                json={
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": "SQL 工具返回了两条课程记录 [id:1] [id:2]。",
-                            }
-                        }
-                    ]
-                },
-            )
-
-        assistant._client = httpx.AsyncClient(  # noqa: SLF001 - transport injection
-            base_url="https://api.deepseek.com",
-            transport=httpx.MockTransport(handler),
-            headers={"Authorization": "Bearer test-key"},
+        model = ScriptedChatModel(script=script)
+        agent = LangChainScheduleAgent(
+            settings, self.toolbox, model, InMemorySaver(), model_name="fake-langchain"
         )
-        try:
-            result = await assistant.run(
-                "查询它的课程",
-                self.toolbox,
-                result_limit=2,
-                conversation_history=[
-                    {"role": "user", "content": "上次查的是230101班。"},
-                    {"role": "assistant", "content": "已记录这个班级。"},
-                ],
+        return agent, model
+
+    async def test_langchain_agent_routes_tools_and_persists_session(self) -> None:
+        agent, model = self._agent(
+            [
+                _tool_call(
+                    "call_sql_1",
+                    SQL_TOOL_NAME,
+                    {
+                        "sql": "SELECT id, course_name FROM courses WHERE class_no='230101' ORDER BY id",
+                        "max_rows": 2,
+                    },
+                ),
+                _tool_call("call_vector_2", VECTOR_TOOL_NAME, {"query": "机器人相关课程", "top_k": 2}),
+                AIMessage(content="SQL 工具返回了两条课程记录 [id:1] [id:2]。"),
+                _tool_call(
+                    "call_sql_3",
+                    SQL_TOOL_NAME,
+                    {"sql": "SELECT id FROM courses WHERE class_no='230101' AND weekday='星期三'"},
+                ),
+                AIMessage(content="周三也有课。"),
+            ]
+        )
+        result = await agent.run("查询230101班的课程", result_limit=2, session_id="session-a1")
+        self.assertEqual([call.name for call in result.calls], [SQL_TOOL_NAME, VECTOR_TOOL_NAME])
+        self.assertTrue(all(call.error is None for call in result.calls))
+        self.assertEqual(result.rounds, 2)
+        self.assertEqual(len(result.courses), 2)
+        self.assertEqual(result.answer, "SQL 工具返回了两条课程记录 [id:1] [id:2]。")
+
+        first, second, third = model.seen[:3]
+        self.assertEqual(first["tool_choice"], "required")
+        self.assertEqual(set(first["tool_names"]), {SQL_TOOL_NAME, VECTOR_TOOL_NAME})
+        self.assertIsNone(second["tool_choice"])
+        self.assertIn("row_count", second["messages"][-1])
+        self.assertEqual(third["roles"][-2:], ["ai", "tool"])
+        self.assertIn("match_count", third["messages"][-1])
+
+        follow_up = await agent.run("那周三呢", result_limit=2, session_id="session-a1")
+        self.assertEqual(follow_up.answer, "周三也有课。")
+        self.assertEqual(follow_up.rounds, 1)
+        # Earlier turns reach the model as question/answer text only.
+        self.assertEqual(model.seen[3]["roles"], ["system", "human", "ai", "human"])
+        self.assertEqual(model.seen[3]["messages"][2], "SQL 工具返回了两条课程记录 [id:1] [id:2]。")
+        self.assertEqual(model.seen[3]["tool_choice"], "required")
+
+        history = await agent.get_history("session-a1")
+        self.assertEqual(
+            [(item.role, item.content) for item in history],
+            [
+                ("user", "查询230101班的课程"),
+                ("assistant", "SQL 工具返回了两条课程记录 [id:1] [id:2]。"),
+                ("user", "那周三呢"),
+                ("assistant", "周三也有课。"),
+            ],
+        )
+        self.assertIsNone(await agent.get_history("session-other"))
+        await agent.delete_session("session-a1")
+        self.assertIsNone(await agent.get_history("session-a1"))
+
+    async def test_langchain_agent_limits_rounds_and_reports_tool_errors(self) -> None:
+        agent, model = self._agent(
+            [
+                _tool_call("call_bad", SQL_TOOL_NAME, {"sql": "DELETE FROM courses"}),
+                AIMessage(content="无法执行写操作，证据不足。"),
+            ],
+            max_tool_rounds=1,
+        )
+        result = await agent.run(
+            "删除课程",
+            result_limit=3,
+            required_filters=SearchFilters(class_no="230101"),
+            session_id="session-b1",
+        )
+        self.assertEqual(result.rounds, 1)
+        self.assertIn("Only SELECT", result.calls[0].error)
+        self.assertIn("Only SELECT", model.seen[1]["messages"][-1])
+        self.assertIn("230101", model.seen[0]["messages"][0])
+        # After the round limit the model is called without tools for the final answer.
+        self.assertIsNone(model.seen[1]["tool_names"])
+
+    async def test_langchain_agent_requires_tool_evidence(self) -> None:
+        agent, _ = self._agent([AIMessage(content="我猜有课。")])
+        with self.assertRaisesRegex(ValueError, "did not call a retrieval tool"):
+            await agent.run("230101班有什么课", result_limit=3, session_id="session-c1")
+
+    def test_fastapi_session_endpoints(self) -> None:
+        agent, _ = self._agent(
+            [
+                _tool_call("call_sql_1", SQL_TOOL_NAME, {"sql": "SELECT id FROM courses LIMIT 1"}),
+                AIMessage(content="找到一条记录 [id:1]。"),
+            ]
+        )
+        app = create_app(settings=self.settings, retriever=self.retriever, assistant=agent)
+        with TestClient(app) as client:
+            response = client.post("/v1/query", json={"question": "随便查一条课"})
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertEqual(body["mode"], "tool_calling")
+            session_id = body["session_id"]
+            self.assertRegex(session_id, r"^[0-9a-f]{32}$")
+
+            history = client.get(f"/v1/sessions/{session_id}")
+            self.assertEqual(history.status_code, 200)
+            self.assertEqual(
+                [item["role"] for item in history.json()["messages"]], ["user", "assistant"]
             )
-            self.assertEqual(request_count, 3)
-            self.assertEqual(result.calls[0].name, SQL_TOOL_NAME)
-            self.assertEqual(result.calls[1].name, VECTOR_TOOL_NAME)
-            self.assertEqual(result.rounds, 2)
-            self.assertEqual(len(result.courses), 2)
-        finally:
-            await assistant.aclose()
+            self.assertEqual(client.get("/v1/sessions/unknown-session").status_code, 404)
+            self.assertEqual(client.get("/v1/sessions/bad%20id").status_code, 422)
+            self.assertEqual(client.delete(f"/v1/sessions/{session_id}").status_code, 204)
+            self.assertEqual(client.get(f"/v1/sessions/{session_id}").status_code, 404)
+            bad = client.post("/v1/query", json={"question": "x", "session_id": "../etc"})
+            self.assertEqual(bad.status_code, 422)
 
     def test_fastapi_health_and_local_query(self) -> None:
         app = create_app(settings=self.settings, retriever=self.retriever)
