@@ -176,7 +176,7 @@ $env:PYTHONPATH = "src"
 .\.rag_venv\Scripts\python.exe -m uvicorn jiaowu_rag.api:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000/docs` for the interactive API page, or query it directly:
+Open `http://127.0.0.1:8000/docs` for the interactive API page, or query it directly. Log in first (see [Login and per-user limits](#login-and-per-user-limits)) and add `-Headers @{ Authorization = "Bearer <token>" }` to the request below:
 
 ```powershell
 $body = @{
@@ -201,7 +201,32 @@ Every agent response includes a `session_id`. Send it back in the next `/v1/quer
 - `GET /v1/sessions/{session_id}` returns the stored user/assistant messages (404 if unknown).
 - `DELETE /v1/sessions/{session_id}` deletes the session.
 
-Session IDs must match `^[A-Za-z0-9_-]{8,128}$`. The API has no authentication or rate limiting yet, so a session ID is effectively a bearer secret: anyone who has it can read or delete that conversation. Add authentication and rate limiting before exposing the service publicly.
+- `GET /v1/sessions` lists the logged-in user's conversations, newest first, titled by their first question.
+
+Session IDs must match `^[A-Za-z0-9_-]{8,128}$`. With login enabled, a session belongs to the user who first used it; other users get 404 for it, even if they know its ID.
+
+### Login and per-user limits
+
+Students log in with a school email and a one-time code; there are no passwords. Only addresses whose domain exactly matches `RAG_ALLOWED_EMAIL_DOMAINS` (default `emails.bjut.edu.cn`, `bjut.edu.cn`, `illinois.edu`) can sign up, and the first successful login creates the account.
+
+1. `POST /v1/auth/request-code` with `{"email": "..."}` emails a 6-digit code, valid for 10 minutes.
+2. `POST /v1/auth/verify` with `{"email": "...", "code": "123456"}` returns a token valid for 30 days.
+3. Send `Authorization: Bearer <token>` with `/v1/query`, `/v1/me`, `/v1/sessions`, and `/v1/auth/logout`. In `/docs`, use the **Authorize** button.
+
+Limits:
+
+| What | Limit |
+|---|---|
+| Codes per email | 1 per minute, 5 per day |
+| Codes per client IP | 20 per day |
+| Wrong guesses per code | 5, then a new code is required |
+| Questions per user | `RAG_USER_QUESTIONS_PER_MINUTE` (5) per minute, `RAG_USER_DAILY_QUESTIONS` (30) per day |
+
+Limited requests return `429` with a Chinese message, and a `Retry-After` header when waiting helps. Daily counts reset at midnight Beijing time. Codes and tokens are stored only as SHA-256 hashes in `RAG_AUTH_DB`.
+
+**Sending the codes.** Set `SMTP_HOST`, `SMTP_USERNAME`, and `SMTP_PASSWORD` in `.env`. For Gmail use `smtp.gmail.com`, port `465`, `SMTP_SECURITY=ssl`, and an *app password* (Google Account → Security → 2-Step Verification → App passwords), not your login password. `SMTP_FROM` defaults to `SMTP_USERNAME`; Gmail rewrites any other sender address unless it is a verified alias. A personal Gmail account can send to roughly 500 recipients a day, which is plenty for about 100 students. Send a test code to your own school address first to check that it isn't filtered as spam. Without `SMTP_HOST`, codes are written to the server log, which is only suitable for local development.
+
+Behind a reverse proxy, start uvicorn with `--proxy-headers --forwarded-allow-ips <proxy ip>` so the per-IP limit sees students' addresses rather than the proxy's. Keep a single server process: the per-minute question limit and the per-session lock live in memory. Set `RAG_AUTH_REQUIRED=false` only for local testing.
 
 Relevant optional settings in `.env`:
 

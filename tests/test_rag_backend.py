@@ -128,6 +128,7 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
             default_top_k=3,
             max_top_k=10,
             usage_db=str(Path(cls._tmp.name) / "usage.sqlite"),
+            auth_required=False,
         )
         cls.toolbox = ScheduleToolbox(cls.retriever, max_results=10)
 

@@ -145,3 +145,41 @@ class SessionMessage(BaseModel):
 class SessionHistoryResponse(BaseModel):
     session_id: str
     messages: list[SessionMessage]
+
+
+class LoginCodeRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class LoginCodeResponse(BaseModel):
+    email: str
+    expires_in_seconds: int
+
+
+class VerifyCodeRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    code: str = Field(pattern=r"^\s*\d{6}\s*$")
+
+
+class TokenResponse(BaseModel):
+    token: str
+    token_type: Literal["bearer"] = "bearer"
+    email: str
+    expires_at: float
+
+
+class MeResponse(BaseModel):
+    email: str
+    questions_today: int
+    daily_question_limit: int
+
+
+class SessionSummaryResponse(BaseModel):
+    session_id: str
+    title: str
+    created_at: float
+    updated_at: float
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionSummaryResponse]

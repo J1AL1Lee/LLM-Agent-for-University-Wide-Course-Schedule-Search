@@ -16,6 +16,10 @@ def beijing_today() -> date:
     return datetime.now(_BEIJING).date()
 
 
+def beijing_day(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, _BEIJING).date().isoformat()
+
+
 def today() -> str:
     return beijing_today().isoformat()
 
