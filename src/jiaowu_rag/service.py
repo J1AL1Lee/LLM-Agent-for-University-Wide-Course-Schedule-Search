@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 
@@ -13,9 +14,14 @@ from .models import (
     RetrievedCourse,
     SearchFilters,
     SessionMessage,
+    TokenUsage,
     ToolCallRecord,
 )
 from .retriever import ChromaScheduleRetriever
+from .usage import UsageLedger
+
+
+logger = logging.getLogger("jiaowu_rag.query")
 
 
 def _elapsed_ms(start: float) -> int:
@@ -55,10 +61,12 @@ class ToolCallingRAGService:
         settings: Settings,
         retriever: ChromaScheduleRetriever,
         assistant: ScheduleAgent | None = None,
+        ledger: UsageLedger | None = None,
     ) -> None:
         self.settings = settings
         self.retriever = retriever
         self.assistant = assistant
+        self.ledger = ledger
 
     async def _local_query(
         self, request: QueryRequest, top_k: int
@@ -82,22 +90,36 @@ class ToolCallingRAGService:
         local_vector_ms: int | None = None
         tool_rounds = 0
         session_id = request.session_id
+        usage: TokenUsage | None = None
 
-        if request.use_deepseek and self.assistant is not None:
+        if (
+            request.use_deepseek
+            and self.assistant is not None
+            and self.ledger is not None
+            and self.ledger.budget_exhausted()
+        ):
+            warnings.append("今日模型调用额度已用完，已降级为 ChromaDB 本地检索。")
+        elif request.use_deepseek and self.assistant is not None:
             session_id = session_id or uuid.uuid4().hex
+            usage = TokenUsage()
             tool_start = time.perf_counter()
             try:
+                # Tools get the full row budget so one class's day is never cut off;
+                # top_k only limits the course list returned to the client.
                 outcome = await self.assistant.run(
                     request.question,
-                    top_k,
+                    self.settings.max_top_k,
                     request.filters,
                     session_id,
+                    usage,
                 )
                 tool_loop_ms = _elapsed_ms(tool_start)
                 tool_calls = outcome.calls
+                if not tool_calls:
+                    warnings.append("这条回答没有查询课表数据；涉及具体课程安排时请以查询结果为准。")
                 tool_rounds = outcome.rounds
                 results = _normalize_ranks(outcome.courses, top_k)
-                return QueryResponse(
+                response = QueryResponse(
                     question=request.question,
                     session_id=session_id,
                     answer=outcome.answer,
@@ -111,20 +133,27 @@ class ToolCallingRAGService:
                         total_ms=_elapsed_ms(total_start),
                         tool_loop_ms=tool_loop_ms,
                         tool_rounds=tool_rounds,
+                        token_usage=usage,
                     ),
                 )
+                self._log(response)
+                return response
             except Exception as exc:
                 tool_loop_ms = _elapsed_ms(tool_start)
+                logger.warning("agent failed session=%s error=%r", session_id, exc)
                 warnings.append(
                     f"LangChain 工具调用循环失败，已降级为 ChromaDB 本地检索：{type(exc).__name__}"
                     "（本轮回答未写入会话历史）"
                 )
+            finally:
+                if self.ledger is not None and usage.model_calls:
+                    self.ledger.record(usage)
         elif request.use_deepseek:
-            warnings.append("DeepSeek 未配置，已降级为 ChromaDB 本地检索。")
+            warnings.append("大模型未配置，已降级为 ChromaDB 本地检索。")
 
         results, applied_filters, local_vector_ms = await self._local_query(request, top_k)
         results = _normalize_ranks(results, top_k)
-        return QueryResponse(
+        response = QueryResponse(
             question=request.question,
             session_id=session_id,
             answer=_local_answer(results),
@@ -139,12 +168,32 @@ class ToolCallingRAGService:
                 local_vector_ms=local_vector_ms,
                 tool_loop_ms=tool_loop_ms,
                 tool_rounds=tool_rounds,
+                token_usage=usage,
             ),
+        )
+        self._log(response)
+        return response
+
+    @staticmethod
+    def _log(response: QueryResponse) -> None:
+        usage = response.diagnostics.token_usage or TokenUsage()
+        logger.info(
+            "query session=%s mode=%s tools=%d rounds=%d model_calls=%d "
+            "input=%d cached=%d output=%d ms=%d",
+            response.session_id,
+            response.mode,
+            len(response.tool_calls),
+            response.diagnostics.tool_rounds,
+            usage.model_calls,
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+            response.diagnostics.total_ms,
         )
 
     def _require_sessions(self) -> ScheduleAgent:
         if self.assistant is None:
-            raise LookupError("Sessions require a configured DeepSeek agent")
+            raise LookupError("Sessions require a configured LLM agent")
         return self.assistant
 
     async def get_session_history(self, session_id: str) -> list[SessionMessage] | None:

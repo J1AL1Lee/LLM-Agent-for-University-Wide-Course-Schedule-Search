@@ -81,11 +81,23 @@ class QueryRequest(BaseModel):
         return value
 
 
+class TokenUsage(BaseModel):
+    model_calls: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
 class QueryDiagnostics(BaseModel):
     total_ms: int
     local_vector_ms: int | None = None
     tool_loop_ms: int | None = None
     tool_rounds: int = 0
+    token_usage: TokenUsage | None = None
 
 
 class ToolCallRecord(BaseModel):
@@ -121,6 +133,8 @@ class HealthResponse(BaseModel):
     indexed_records: int
     deepseek_configured: bool
     deepseek_model: str | None = None
+    tokens_used_today: int = 0
+    daily_token_budget: int = 0
 
 
 class SessionMessage(BaseModel):
@@ -131,3 +145,41 @@ class SessionMessage(BaseModel):
 class SessionHistoryResponse(BaseModel):
     session_id: str
     messages: list[SessionMessage]
+
+
+class LoginCodeRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class LoginCodeResponse(BaseModel):
+    email: str
+    expires_in_seconds: int
+
+
+class VerifyCodeRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    code: str = Field(pattern=r"^\s*\d{6}\s*$")
+
+
+class TokenResponse(BaseModel):
+    token: str
+    token_type: Literal["bearer"] = "bearer"
+    email: str
+    expires_at: float
+
+
+class MeResponse(BaseModel):
+    email: str
+    questions_today: int
+    daily_question_limit: int
+
+
+class SessionSummaryResponse(BaseModel):
+    session_id: str
+    title: str
+    created_at: float
+    updated_at: float
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionSummaryResponse]

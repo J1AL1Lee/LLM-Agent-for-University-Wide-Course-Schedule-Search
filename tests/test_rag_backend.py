@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
-
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -13,20 +14,36 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
-from jiaowu_rag.agent import LangChainScheduleAgent
+from jiaowu_rag.agent import FINAL_ROUND_NOTE, TOOL_NUDGE, LangChainScheduleAgent, date_note
 from jiaowu_rag.api import create_app
 from jiaowu_rag.config import Settings
-from jiaowu_rag.models import QueryRequest, SearchFilters, ToolCallRecord, ToolLoopResult
+from jiaowu_rag.models import (
+    QueryRequest,
+    SearchFilters,
+    TokenUsage,
+    ToolCallRecord,
+    ToolLoopResult,
+)
 from jiaowu_rag.retriever import ChromaScheduleRetriever
 from jiaowu_rag.service import ToolCallingRAGService
 from jiaowu_rag.tools import SQL_TOOL_NAME, VECTOR_TOOL_NAME, ScheduleToolbox
+from jiaowu_rag.usage import UsageLedger
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _tool_call(call_id: str, name: str, args: dict[str, Any]) -> AIMessage:
-    return AIMessage(content="", tool_calls=[{"id": call_id, "name": name, "args": args}])
+    return AIMessage(
+        content="",
+        tool_calls=[{"id": call_id, "name": name, "args": args}],
+        usage_metadata={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_token_details": {"cache_read": 40},
+        },
+    )
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -66,7 +83,13 @@ class FakeToolCallingAssistant:
         result_limit: int,
         required_filters: SearchFilters | None = None,
         session_id: str | None = None,
+        usage: TokenUsage | None = None,
     ) -> ToolLoopResult:
+        self.calls = getattr(self, "calls", 0) + 1
+        if usage is not None:
+            usage.model_calls += 2
+            usage.input_tokens += 1000
+            usage.output_tokens += 200
         toolbox = self.toolbox
         arguments = {
             "sql": (
@@ -97,14 +120,55 @@ class FakeToolCallingAssistant:
 class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
         cls.retriever = ChromaScheduleRetriever(PROJECT_ROOT)
         cls.settings = Settings(
             project_root=PROJECT_ROOT,
-            deepseek_api_key=None,
+            llm_api_key=None,
             default_top_k=3,
             max_top_k=10,
+            usage_db=str(Path(cls._tmp.name) / "usage.sqlite"),
+            auth_required=False,
         )
         cls.toolbox = ScheduleToolbox(cls.retriever, max_results=10)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _ledger(self, budget: int) -> UsageLedger:
+        ledger = UsageLedger(Path(self._tmp.name) / f"ledger-{self.id()}.sqlite", budget)
+        self.addCleanup(ledger.close)
+        return ledger
+
+    def test_usage_ledger_tracks_daily_budget(self) -> None:
+        ledger = self._ledger(budget=1500)
+        self.assertFalse(ledger.budget_exhausted())
+        ledger.record(TokenUsage(model_calls=2, input_tokens=900, cached_input_tokens=400, output_tokens=100))
+        ledger.record(TokenUsage(model_calls=1, input_tokens=400, output_tokens=50), day="2000-01-01")
+        self.assertEqual(ledger.tokens_used(), 1000)
+        self.assertFalse(ledger.budget_exhausted())
+        ledger.record(TokenUsage(model_calls=1, input_tokens=500))
+        self.assertTrue(ledger.budget_exhausted())
+        self.assertFalse(self._ledger(budget=0).budget_exhausted())
+
+    async def test_service_records_usage_and_stops_at_budget(self) -> None:
+        assistant = FakeToolCallingAssistant(self.toolbox)
+        ledger = self._ledger(budget=1500)
+        service = ToolCallingRAGService(self.settings, self.retriever, assistant, ledger)
+        question = QueryRequest(question="230101班星期二第一二节有什么课")
+
+        first = await service.query(question)
+        self.assertEqual(first.mode, "tool_calling")
+        self.assertEqual(first.diagnostics.token_usage.total_tokens, 1200)
+        self.assertEqual(ledger.tokens_used(), 1200)
+
+        await service.query(question)
+        self.assertTrue(ledger.budget_exhausted())
+        third = await service.query(question)
+        self.assertEqual(third.mode, "local_only")
+        self.assertIn("额度", third.warnings[0])
+        self.assertEqual(assistant.calls, 2)
 
     def test_chroma_collection_is_loaded(self) -> None:
         self.assertEqual(self.retriever.manifest["storage"], "chromadb")
@@ -149,6 +213,32 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
                 {"sql": "SELECT id, load_extension('untrusted') FROM courses"},
                 3,
             )
+
+    def test_text_to_sql_tool_flags_truncated_results(self) -> None:
+        sql = "SELECT id FROM courses WHERE class_no='230101' ORDER BY id"
+        truncated = json.loads(self.toolbox.execute(SQL_TOOL_NAME, {"sql": sql, "max_rows": 3}, 3).content)
+        self.assertEqual(truncated["row_count"], 3)
+        self.assertTrue(truncated["truncated"])
+        complete = json.loads(
+            self.toolbox.execute(SQL_TOOL_NAME, {"sql": sql + " LIMIT 2", "max_rows": 3}, 3).content
+        )
+        self.assertNotIn("truncated", complete)
+
+    def test_llm_settings_default_to_model_studio_and_disable_thinking(self) -> None:
+        settings = Settings(project_root=PROJECT_ROOT, llm_api_key="k")
+        self.assertIn("dashscope.aliyuncs.com", settings.llm_api_base)
+        self.assertEqual(settings.llm_request_extra_body, {"enable_thinking": False})
+        deepseek = Settings(project_root=PROJECT_ROOT, llm_api_key="k", llm_api_base="https://api.deepseek.com")
+        self.assertEqual(deepseek.llm_request_extra_body, {"thinking": {"type": "disabled"}})
+        custom = Settings(project_root=PROJECT_ROOT, llm_api_key="k", llm_extra_body={})
+        self.assertEqual(custom.llm_request_extra_body, {})
+
+    def test_date_note_resolves_weekday_and_teaching_week(self) -> None:
+        monday = date(2026, 9, 21)
+        self.assertIn("2026-09-21 星期一", date_note(monday, None))
+        self.assertIn("教学周未知", date_note(monday, None))
+        self.assertIn("第 3 教学周", date_note(monday, date(2026, 9, 7)))
+        self.assertIn("尚未开始", date_note(monday, date(2026, 9, 28)))
 
     def test_text_to_sql_tool_allows_safe_aggregation(self) -> None:
         result = self.toolbox.execute(
@@ -203,7 +293,7 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
     ) -> tuple[LangChainScheduleAgent, ScriptedChatModel]:
         settings = Settings(
             project_root=PROJECT_ROOT,
-            deepseek_api_key=None,
+            llm_api_key=None,
             max_tool_rounds=max_tool_rounds,
         )
         model = ScriptedChatModel(script=script)
@@ -224,7 +314,11 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ),
                 _tool_call("call_vector_2", VECTOR_TOOL_NAME, {"query": "机器人相关课程", "top_k": 2}),
-                AIMessage(content="SQL 工具返回了两条课程记录 [id:1] [id:2]。"),
+                AIMessage(
+                    content="SQL 工具返回了两条课程记录 [id:1] [id:2]。",
+                    usage_metadata={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+                    response_metadata={"token_usage": {"prompt_cache_hit_tokens": 40}},
+                ),
                 _tool_call(
                     "call_sql_3",
                     SQL_TOOL_NAME,
@@ -233,7 +327,14 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
                 AIMessage(content="周三也有课。"),
             ]
         )
-        result = await agent.run("查询230101班的课程", result_limit=2, session_id="session-a1")
+        usage = TokenUsage()
+        result = await agent.run(
+            "查询230101班的课程", result_limit=2, session_id="session-a1", usage=usage
+        )
+        self.assertEqual(usage.model_calls, 3)
+        self.assertEqual(usage.input_tokens, 300)
+        self.assertEqual(usage.cached_input_tokens, 120)
+        self.assertEqual(usage.output_tokens, 60)
         self.assertEqual([call.name for call in result.calls], [SQL_TOOL_NAME, VECTOR_TOOL_NAME])
         self.assertTrue(all(call.error is None for call in result.calls))
         self.assertEqual(result.rounds, 2)
@@ -241,7 +342,8 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.answer, "SQL 工具返回了两条课程记录 [id:1] [id:2]。")
 
         first, second, third = model.seen[:3]
-        self.assertEqual(first["tool_choice"], "required")
+        # No tool_choice="required": Qwen rejects it, so evidence is enforced by a reminder.
+        self.assertIsNone(first["tool_choice"])
         self.assertEqual(set(first["tool_names"]), {SQL_TOOL_NAME, VECTOR_TOOL_NAME})
         self.assertIsNone(second["tool_choice"])
         self.assertIn("row_count", second["messages"][-1])
@@ -254,7 +356,6 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         # Earlier turns reach the model as question/answer text only.
         self.assertEqual(model.seen[3]["roles"], ["system", "human", "ai", "human"])
         self.assertEqual(model.seen[3]["messages"][2], "SQL 工具返回了两条课程记录 [id:1] [id:2]。")
-        self.assertEqual(model.seen[3]["tool_choice"], "required")
 
         history = await agent.get_history("session-a1")
         self.assertEqual(
@@ -286,15 +387,68 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.rounds, 1)
         self.assertIn("Only SELECT", result.calls[0].error)
-        self.assertIn("Only SELECT", model.seen[1]["messages"][-1])
+        self.assertIn("Only SELECT", model.seen[1]["messages"][-2])
         self.assertIn("230101", model.seen[0]["messages"][0])
-        # After the round limit the model is called without tools for the final answer.
+        # After the round limit the model is called without tools and told to answer now.
         self.assertIsNone(model.seen[1]["tool_names"])
+        self.assertEqual(model.seen[1]["messages"][-1], FINAL_ROUND_NOTE)
+        # The nudge is request-only and never becomes part of the stored conversation.
+        history = await agent.get_history("session-b1")
+        self.assertEqual([item.content for item in history], ["删除课程", "无法执行写操作，证据不足。"])
 
-    async def test_langchain_agent_requires_tool_evidence(self) -> None:
-        agent, _ = self._agent([AIMessage(content="我猜有课。")])
-        with self.assertRaisesRegex(ValueError, "did not call a retrieval tool"):
-            await agent.run("230101班有什么课", result_limit=3, session_id="session-c1")
+    async def test_langchain_agent_rejects_leaked_tool_markup(self) -> None:
+        leaked = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"query_schedule_sql\">"
+        agent, model = self._agent(
+            [
+                _tool_call("call_1", SQL_TOOL_NAME, {"sql": "SELECT id FROM courses LIMIT 1"}),
+                AIMessage(content=leaked),
+                _tool_call("call_2", SQL_TOOL_NAME, {"sql": "SELECT id FROM courses LIMIT 1"}),
+                AIMessage(content="找到一条记录。"),
+            ],
+            max_tool_rounds=1,
+        )
+        with self.assertRaisesRegex(ValueError, "no usable final answer"):
+            await agent.run("有哪些课", result_limit=3, session_id="session-d1")
+        result = await agent.run("再查一次", result_limit=3, session_id="session-d1")
+        self.assertEqual(result.answer, "找到一条记录。")
+        # The leaked markup is neither replayed to the model nor shown in history.
+        self.assertFalse(any("DSML" in text for text in model.seen[2]["messages"]))
+        history = await agent.get_history("session-d1")
+        self.assertFalse(any("DSML" in item.content for item in history))
+
+    async def test_langchain_agent_keeps_toolless_reply_after_one_reminder(self) -> None:
+        refusal = "我无法执行 DELETE 操作，只能做只读查询。"
+        agent, model = self._agent([AIMessage(content="不能删除。"), AIMessage(content=refusal)])
+        result = await agent.run("执行 DELETE FROM courses", result_limit=3, session_id="session-c1")
+        # Exactly one reminder; the second tool-free reply is kept but carries no evidence.
+        self.assertEqual(len(model.seen), 2)
+        self.assertEqual(model.seen[1]["messages"][-1], TOOL_NUDGE)
+        self.assertEqual(result.answer, refusal)
+        self.assertEqual(result.calls, [])
+
+    async def test_service_labels_answers_without_tool_evidence(self) -> None:
+        agent, _ = self._agent([AIMessage(content="你是哪个班的？"), AIMessage(content="请告诉我你的班级号。")])
+        service = ToolCallingRAGService(self.settings, self.retriever, agent)
+        response = await service.query(QueryRequest(question="我明天有什么课"))
+        self.assertEqual(response.mode, "tool_calling")
+        self.assertEqual(response.answer, "请告诉我你的班级号。")
+        self.assertIn("没有查询课表数据", response.warnings[0])
+
+    async def test_langchain_agent_reminds_model_to_use_tools_once(self) -> None:
+        agent, model = self._agent(
+            [
+                AIMessage(content="我猜有课。"),
+                _tool_call("call_1", SQL_TOOL_NAME, {"sql": "SELECT id FROM courses LIMIT 1"}),
+                AIMessage(content="查到一条记录。"),
+            ]
+        )
+        result = await agent.run("230101班有什么课", result_limit=3, session_id="session-e1")
+        self.assertEqual(result.answer, "查到一条记录。")
+        self.assertEqual(result.rounds, 1)
+        self.assertEqual(model.seen[1]["messages"][-1], TOOL_NUDGE)
+        # Neither the unfounded first reply nor the reminder is stored.
+        history = await agent.get_history("session-e1")
+        self.assertEqual([item.content for item in history], ["230101班有什么课", "查到一条记录。"])
 
     def test_fastapi_session_endpoints(self) -> None:
         agent, _ = self._agent(
@@ -327,9 +481,10 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
     def test_fastapi_health_and_local_query(self) -> None:
         app = create_app(settings=self.settings, retriever=self.retriever)
         with TestClient(app) as client:
-            root = client.get("/", follow_redirects=False)
-            self.assertEqual(root.status_code, 307)
-            self.assertEqual(root.headers["location"], "/docs")
+            root = client.get("/")
+            self.assertEqual(root.status_code, 200)
+            self.assertIn("text/html", root.headers["content-type"])
+            self.assertIn("北工大课表助手", root.text)
             health = client.get("/health")
             self.assertEqual(health.status_code, 200)
             self.assertEqual(health.json()["indexed_records"], 11115)

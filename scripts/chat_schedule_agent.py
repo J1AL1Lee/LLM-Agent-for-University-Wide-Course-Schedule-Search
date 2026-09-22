@@ -38,8 +38,8 @@ def parse_args() -> argparse.Namespace:
 
 async def run_chat(args: argparse.Namespace) -> int:
     settings = Settings.from_env(PROJECT_ROOT)
-    if not settings.deepseek_api_key:
-        print("错误：未配置 DEEPSEEK_API_KEY。请先在项目根目录的 .env 中设置。", file=sys.stderr)
+    if not settings.llm_api_key:
+        print("错误：未配置 LLM_API_KEY。请先在项目根目录的 .env 中设置。", file=sys.stderr)
         return 2
     top_k = args.top_k or settings.default_top_k
     if top_k < 1 or top_k > settings.max_top_k:
