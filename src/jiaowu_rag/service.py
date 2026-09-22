@@ -104,15 +104,19 @@ class ToolCallingRAGService:
             usage = TokenUsage()
             tool_start = time.perf_counter()
             try:
+                # Tools get the full row budget so one class's day is never cut off;
+                # top_k only limits the course list returned to the client.
                 outcome = await self.assistant.run(
                     request.question,
-                    top_k,
+                    self.settings.max_top_k,
                     request.filters,
                     session_id,
                     usage,
                 )
                 tool_loop_ms = _elapsed_ms(tool_start)
                 tool_calls = outcome.calls
+                if not tool_calls:
+                    warnings.append("这条回答没有查询课表数据；涉及具体课程安排时请以查询结果为准。")
                 tool_rounds = outcome.rounds
                 results = _normalize_ranks(outcome.courses, top_k)
                 response = QueryResponse(
@@ -145,7 +149,7 @@ class ToolCallingRAGService:
                 if self.ledger is not None and usage.model_calls:
                     self.ledger.record(usage)
         elif request.use_deepseek:
-            warnings.append("DeepSeek 未配置，已降级为 ChromaDB 本地检索。")
+            warnings.append("大模型未配置，已降级为 ChromaDB 本地检索。")
 
         results, applied_filters, local_vector_ms = await self._local_query(request, top_k)
         results = _normalize_ranks(results, top_k)
@@ -189,7 +193,7 @@ class ToolCallingRAGService:
 
     def _require_sessions(self) -> ScheduleAgent:
         if self.assistant is None:
-            raise LookupError("Sessions require a configured DeepSeek agent")
+            raise LookupError("Sessions require a configured LLM agent")
         return self.assistant
 
     async def get_session_history(self, session_id: str) -> list[SessionMessage] | None:

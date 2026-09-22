@@ -29,8 +29,7 @@ from jiaowu_rag.usage import beijing_today  # noqa: E402
 
 
 DEFAULT_CASES = PROJECT_ROOT / "evals" / "schedule_questions.json"
-# deepseek-flash peak prices in USD per 1M tokens (api-docs.deepseek.com, 2026-09).
-# Off-peak is half. Update these when DeepSeek changes pricing.
+# Default prices per 1M tokens (deepseek-flash peak, USD, 2026-09); pass --price-* for your model.
 PRICE_INPUT_MISS = 0.30
 PRICE_INPUT_HIT = 0.006
 PRICE_OUTPUT = 1.20
@@ -48,7 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
     parser.add_argument("--only", nargs="*", default=None, help="Case ids or categories to run.")
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--top-k", type=int, default=None, help="Omit to use the server default, like the chat page."
+    )
+    parser.add_argument("--price-input", type=float, default=PRICE_INPUT_MISS, help="Per 1M uncached input tokens.")
+    parser.add_argument("--price-cached", type=float, default=PRICE_INPUT_HIT, help="Per 1M cached input tokens.")
+    parser.add_argument("--price-output", type=float, default=PRICE_OUTPUT, help="Per 1M output tokens.")
     return parser.parse_args()
 
 
@@ -97,15 +101,9 @@ def grade(
         found = number_in_answer(expected, answer)
         return found, f"expected {expected}" + ("" if found else " not in answer")
 
-    if check == "keywords_in_results":
-        scope = case.get("class_scope")
-        names = {
-            item.course_name
-            for item in response.results
-            if not scope or item.class_no == scope or scope in item.target_classes.split(";")
-        }
-        keywords = [normalize(word) for word in case["keywords"]]
-        hits = sorted(name for name in names if any(word in normalize(name) for word in keywords))
+    if check == "keywords_in_answer":
+        # gold holds every real course name matching the keywords; count those the answer names.
+        hits = sorted(name for name in gold if normalize(name) in answer)
         return len(hits) >= case["min_hits"], f"{len(hits)} matching courses {hits[:6]}"
 
     if check == "says_none":
@@ -123,12 +121,27 @@ def grade(
     raise ValueError(f"Unknown check: {check}")
 
 
+def keyword_courses_sql(case: dict[str, Any]) -> tuple[str, list[str]]:
+    keywords = case["keywords"]
+    sql = "SELECT DISTINCT course_name FROM courses WHERE (" + " OR ".join(
+        "course_name LIKE ?" for _ in keywords
+    ) + ")"
+    params = [f"%{word}%" for word in keywords]
+    if case.get("class_scope"):
+        sql += " AND (class_no = ? OR target_classes LIKE ?)"
+        params += [case["class_scope"], f"%{case['class_scope']}%"]
+    return sql, params
+
+
+PRICES = {"input": PRICE_INPUT_MISS, "cached": PRICE_INPUT_HIT, "output": PRICE_OUTPUT}
+
+
 def cost_usd(usage: TokenUsage) -> float:
     miss = usage.input_tokens - usage.cached_input_tokens
     return (
-        miss * PRICE_INPUT_MISS
-        + usage.cached_input_tokens * PRICE_INPUT_HIT
-        + usage.output_tokens * PRICE_OUTPUT
+        miss * PRICES["input"]
+        + usage.cached_input_tokens * PRICES["cached"]
+        + usage.output_tokens * PRICES["output"]
     ) / 1_000_000
 
 
@@ -144,7 +157,11 @@ async def run_case(
     try:
         tomorrow = WEEKDAYS[(beijing_today() + timedelta(days=1)).weekday()]
         gold_sql = case.get("gold_sql", "").replace("{tomorrow_weekday}", tomorrow)
-        gold = [row[0] for row in connection.execute(gold_sql)] if gold_sql else []
+        if case["check"] == "keywords_in_answer":
+            gold_sql, params = keyword_courses_sql(case)
+            gold = [row[0] for row in connection.execute(gold_sql, params)]
+        else:
+            gold = [row[0] for row in connection.execute(gold_sql)] if gold_sql else []
     finally:
         connection.close()
 
@@ -188,6 +205,7 @@ async def run_case(
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    PRICES.update(input=args.price_input, cached=args.price_cached, output=args.price_output)
     cases = json.loads(args.cases.read_text(encoding="utf-8"))
     if args.only:
         wanted = set(args.only)
@@ -199,14 +217,14 @@ async def main_async(args: argparse.Namespace) -> int:
     output_dir = PROJECT_ROOT / "output" / "eval"
     output_dir.mkdir(parents=True, exist_ok=True)
     settings = Settings.from_env(PROJECT_ROOT)
-    if not settings.deepseek_api_key:
-        print("DEEPSEEK_API_KEY is not configured.", file=sys.stderr)
+    if not settings.llm_api_key:
+        print("LLM_API_KEY is not configured.", file=sys.stderr)
         return 2
     # Keep evaluation sessions out of the service's session store and daily budget.
     settings = dataclasses.replace(
         settings,
         session_db=str(output_dir / "eval_sessions.sqlite"),
-        max_top_k=max(settings.max_top_k, args.top_k),
+        max_top_k=max(settings.max_top_k, args.top_k or 0),
     )
     retriever = ChromaScheduleRetriever(
         PROJECT_ROOT,
@@ -255,8 +273,9 @@ async def main_async(args: argparse.Namespace) -> int:
         "by_category": {key: f"{sum(v)}/{len(v)}" for key, v in sorted(by_category.items())},
         "questions": questions,
         "usage": total_usage.model_dump(),
-        "estimated_cost_usd_peak": round(total_cost, 4),
-        "average_cost_usd_per_question_peak": round(total_cost / questions, 5),
+        "estimated_cost": round(total_cost, 4),
+        "average_cost_per_question": round(total_cost / questions, 5),
+        "average_tokens_per_question": round(total_usage.total_tokens / questions),
         "average_seconds_per_case": round(
             sum(result["elapsed_ms"] for result in results) / len(results) / 1000, 1
         ),

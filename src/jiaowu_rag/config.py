@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,14 +22,33 @@ def _env_str(name: str) -> str | None:
     return os.getenv(name, "").strip() or None
 
 
+def _env_llm(name: str, default: str | None = None) -> str | None:
+    """Read LLM_<name>, falling back to the older DEEPSEEK_<name> variables."""
+    return _env_str(f"LLM_{name}") or _env_str(f"DEEPSEEK_{name}") or default
+
+
+DASHSCOPE_BEIJING = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def default_extra_body(api_base: str) -> dict:
+    """Turn off thinking mode; each provider spells the switch differently."""
+    if "dashscope" in api_base or "aliyuncs.com" in api_base:
+        return {"enable_thinking": False}
+    if "deepseek.com" in api_base:
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     project_root: Path
-    deepseek_api_key: str | None
-    deepseek_model: str = "deepseek-v4-flash"
-    deepseek_api_base: str = "https://api.deepseek.com"
-    deepseek_timeout_seconds: float = 45.0
-    deepseek_enabled: bool = True
+    llm_api_key: str | None
+    llm_model: str = "qwen3.8-max"
+    llm_api_base: str = DASHSCOPE_BEIJING
+    llm_timeout_seconds: float = 60.0
+    llm_enabled: bool = True
+    # Extra JSON merged into every chat request; None means default_extra_body(llm_api_base).
+    llm_extra_body: dict | None = field(default=None, hash=False, compare=False)
     default_top_k: int = 5
     max_top_k: int = 20
     chroma_dir: str = "output/chroma_db"
@@ -55,14 +75,15 @@ class Settings:
     def from_env(cls, project_root: Path | None = None) -> "Settings":
         root = (project_root or Path(__file__).resolve().parents[2]).resolve()
         load_dotenv(root / ".env", override=False)
-        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip() or None
+        extra_body = _env_str("LLM_EXTRA_BODY")
         return cls(
             project_root=root,
-            deepseek_api_key=api_key,
-            deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip(),
-            deepseek_api_base=os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com").rstrip("/"),
-            deepseek_timeout_seconds=float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "45")),
-            deepseek_enabled=_env_bool("DEEPSEEK_ENABLED", True),
+            llm_api_key=_env_llm("API_KEY"),
+            llm_model=_env_llm("MODEL", "qwen3.8-max"),
+            llm_api_base=_env_llm("API_BASE", DASHSCOPE_BEIJING).rstrip("/"),
+            llm_timeout_seconds=float(_env_llm("TIMEOUT_SECONDS", "60")),
+            llm_enabled=_env_bool("LLM_ENABLED", _env_bool("DEEPSEEK_ENABLED", True)),
+            llm_extra_body=json.loads(extra_body) if extra_body else None,
             default_top_k=int(os.getenv("RAG_DEFAULT_TOP_K", "5")),
             max_top_k=int(os.getenv("RAG_MAX_TOP_K", "20")),
             chroma_dir=os.getenv("RAG_CHROMA_DIR", "output/chroma_db").strip(),
@@ -97,3 +118,9 @@ class Settings:
     def resolve_path(self, value: str) -> Path:
         path = Path(value)
         return path if path.is_absolute() else self.project_root / path
+
+    @property
+    def llm_request_extra_body(self) -> dict:
+        if self.llm_extra_body is not None:
+            return self.llm_extra_body
+        return default_extra_body(self.llm_api_base)

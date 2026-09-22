@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .agent import LangChainScheduleAgent, ScheduleAgent
@@ -33,6 +33,7 @@ from .usage import UsageLedger
 
 
 logger = logging.getLogger("jiaowu_rag.auth")
+CHAT_PAGE = Path(__file__).resolve().parent / "static" / "index.html"
 _bearer = HTTPBearer(auto_error=False, description="Token from POST /v1/auth/verify")
 
 
@@ -69,8 +70,8 @@ def create_app(
         active_assistant = assistant
         if (
             active_assistant is None
-            and configured_settings.deepseek_enabled
-            and configured_settings.deepseek_api_key
+            and configured_settings.llm_enabled
+            and configured_settings.llm_api_key
         ):
             active_assistant = await LangChainScheduleAgent.create(
                 configured_settings,
@@ -143,8 +144,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="Session not found")
 
     @app.get("/", include_in_schema=False)
-    async def root() -> RedirectResponse:
-        return RedirectResponse(url="/docs", status_code=307)
+    async def chat_page() -> FileResponse:
+        # no-cache: students get a changed page on their next visit, not a stale copy.
+        return FileResponse(CHAT_PAGE, headers={"Cache-Control": "no-cache"})
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:

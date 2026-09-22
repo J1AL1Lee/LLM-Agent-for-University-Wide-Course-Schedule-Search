@@ -185,7 +185,7 @@ class AuthApiTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         settings = Settings(
             project_root=PROJECT_ROOT,
-            deepseek_api_key=None,
+            llm_api_key=None,
             usage_db=str(Path(tmp.name) / "usage.sqlite"),
         )
         self.clock = Clock()

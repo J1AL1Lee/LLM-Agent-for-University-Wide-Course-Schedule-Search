@@ -10,7 +10,7 @@ A timetable crawler and local retrieval pipeline for Beijing University of Techn
 - Convert legacy `.xls` files into structured schedule records.
 - Build a local SQLite database and RAG-ready text corpus.
 - Store and query Chinese schedule embeddings in a persistent ChromaDB collection.
-- Route questions through a LangChain agent (DeepSeek model) between read-only Text-to-SQL and ChromaDB retrieval, with conversations persisted per session ID.
+- Route questions through a LangChain agent (any OpenAI-compatible model: Qwen or DeepSeek on Alibaba Model Studio, or DeepSeek directly) between read-only Text-to-SQL and ChromaDB retrieval, with conversations persisted per session ID.
 
 ## Requirements
 
@@ -152,9 +152,9 @@ Add `--json` to produce machine-readable output suitable for an API or agent bac
 
 ## Text-to-SQL and Vector Tool-Calling API
 
-When DeepSeek is configured, the API runs a LangChain agent (`langchain.agents.create_agent` with `ChatDeepSeek`) rather than a fixed retrieval pipeline:
+When a model is configured, the API runs a LangChain agent (`langchain.agents.create_agent` with `ChatOpenAI` pointed at any OpenAI-compatible endpoint) rather than a fixed retrieval pipeline:
 
-1. The model receives two tools and must call at least one before answering (`tool_choice=required` on the first round of every turn).
+1. The model receives two tools and must call at least one before answering. Not every provider supports `tool_choice="required"` (Qwen does not), so if the model answers without calling a tool it gets one reminder; if it still does not, the turn fails and the query falls back to local retrieval.
 2. `query_schedule_sql` is the Text-to-SQL tool for exact filtering, joins-free aggregation, counting, grouping, and comparison over the `courses` table.
 3. `search_schedule_vectors` performs semantic search in the persistent ChromaDB collection and accepts optional metadata filters.
 4. Tool results are returned to the model as tool messages. It may call either tool again, call the other tool, or produce a grounded final answer. After `RAG_MAX_TOOL_ROUNDS` rounds the model is called without tools for its final answer.
@@ -166,7 +166,7 @@ Install and configure the backend:
 ```powershell
 .\.rag_venv\Scripts\python.exe -m pip install -r .\requirements-backend.txt
 Copy-Item .env.example .env
-# Edit .env and set DEEPSEEK_API_KEY. Never commit the real key.
+# Edit .env and set LLM_API_KEY (plus LLM_MODEL / LLM_API_BASE). Never commit the real key.
 ```
 
 Start it from the project root:
@@ -175,6 +175,8 @@ Start it from the project root:
 $env:PYTHONPATH = "src"
 .\.rag_venv\Scripts\python.exe -m uvicorn jiaowu_rag.api:app --host 127.0.0.1 --port 8000
 ```
+
+Open `http://127.0.0.1:8000/` for the student chat page: log in with a school email code, ask questions, follow up in the same conversation, and reopen or delete earlier conversations from the sidebar. It is a single static file (`src/jiaowu_rag/static/index.html`) with no build step and no third-party scripts, so it loads reliably from mainland China; it works on phones and follows the system light/dark theme. Answers are rendered from Markdown with all HTML escaped.
 
 Open `http://127.0.0.1:8000/docs` for the interactive API page, or query it directly. Log in first (see [Login and per-user limits](#login-and-per-user-limits)) and add `-Headers @{ Authorization = "Bearer <token>" }` to the request below:
 
@@ -192,7 +194,7 @@ Invoke-RestMethod `
   -Body $body
 ```
 
-`GET /health` reports the Chroma collection record count and whether DeepSeek is configured. Query responses use mode `tool_calling` when the loop succeeds and include a `tool_calls` trace. Set `use_deepseek` to `false` to force local-only ChromaDB retrieval.
+`GET /health` reports the Chroma collection record count and whether a model is configured (the response fields keep their original `deepseek_*` names for compatibility). Query responses use mode `tool_calling` when the loop succeeds and include a `tool_calls` trace. Set `use_deepseek` to `false` to force local-only ChromaDB retrieval.
 
 ### Sessions
 
@@ -228,6 +230,10 @@ Limited requests return `429` with a Chinese message, and a `Retry-After` header
 
 Behind a reverse proxy, start uvicorn with `--proxy-headers --forwarded-allow-ips <proxy ip>` so the per-IP limit sees students' addresses rather than the proxy's. Keep a single server process: the per-minute question limit and the per-session lock live in memory. Set `RAG_AUTH_REQUIRED=false` only for local testing.
 
+### Choosing the model
+
+Set `LLM_API_KEY`, `LLM_MODEL`, and `LLM_API_BASE` in `.env`. The default endpoint is Alibaba Model Studio (Beijing), `https://dashscope.aliyuncs.com/compatible-mode/v1`, where both Qwen models (e.g. `qwen3.8-max`) and DeepSeek models (e.g. `deepseek-v4-pro-0813`) are served; Model Studio API keys only work in the region they were created in. To use DeepSeek's own API instead, set `LLM_API_BASE=https://api.deepseek.com`. Thinking mode is switched off automatically for both (`enable_thinking=false` on Model Studio, `thinking: disabled` on DeepSeek); override with `LLM_EXTRA_BODY` (JSON). The older `DEEPSEEK_*` variables still work. After switching models, rerun the evaluation below, because models differ in how well they write SQL.
+
 Relevant optional settings in `.env`:
 
 ```dotenv
@@ -258,7 +264,7 @@ Every agent response reports `diagnostics.token_usage` (model calls, input, cach
 .\.rag_venv\Scripts\python.exe .\scripts\eval_agent.py --only teacher multiturn
 ```
 
-This calls DeepSeek and costs tokens (roughly $0.05 for the full set at peak prices). Results and a cost estimate are printed, and the full transcript is saved to `output/eval/report-*.json`. Evaluation sessions use `output/eval/eval_sessions.sqlite` and do not count toward the service's daily budget. Rerun it after changing prompts, tools, or the model.
+This calls the configured model and costs tokens: about 6,500 tokens per question, roughly 250,000 for the full set. Pass `--price-input`, `--price-cached`, and `--price-output` (per 1M tokens) for your model's prices; the defaults are DeepSeek's. Results and a cost estimate are printed, and the full transcript is saved to `output/eval/report-*.json`. Evaluation sessions use `output/eval/eval_sessions.sqlite` and do not count toward the service's daily budget. Rerun it after changing prompts, tools, or the model.
 
 ### Multi-turn terminal agent
 

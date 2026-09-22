@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
-from jiaowu_rag.agent import LangChainScheduleAgent, date_note
+from jiaowu_rag.agent import FINAL_ROUND_NOTE, TOOL_NUDGE, LangChainScheduleAgent, date_note
 from jiaowu_rag.api import create_app
 from jiaowu_rag.config import Settings
 from jiaowu_rag.models import (
@@ -124,7 +124,7 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         cls.retriever = ChromaScheduleRetriever(PROJECT_ROOT)
         cls.settings = Settings(
             project_root=PROJECT_ROOT,
-            deepseek_api_key=None,
+            llm_api_key=None,
             default_top_k=3,
             max_top_k=10,
             usage_db=str(Path(cls._tmp.name) / "usage.sqlite"),
@@ -224,6 +224,15 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("truncated", complete)
 
+    def test_llm_settings_default_to_model_studio_and_disable_thinking(self) -> None:
+        settings = Settings(project_root=PROJECT_ROOT, llm_api_key="k")
+        self.assertIn("dashscope.aliyuncs.com", settings.llm_api_base)
+        self.assertEqual(settings.llm_request_extra_body, {"enable_thinking": False})
+        deepseek = Settings(project_root=PROJECT_ROOT, llm_api_key="k", llm_api_base="https://api.deepseek.com")
+        self.assertEqual(deepseek.llm_request_extra_body, {"thinking": {"type": "disabled"}})
+        custom = Settings(project_root=PROJECT_ROOT, llm_api_key="k", llm_extra_body={})
+        self.assertEqual(custom.llm_request_extra_body, {})
+
     def test_date_note_resolves_weekday_and_teaching_week(self) -> None:
         monday = date(2026, 9, 21)
         self.assertIn("2026-09-21 星期一", date_note(monday, None))
@@ -284,7 +293,7 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
     ) -> tuple[LangChainScheduleAgent, ScriptedChatModel]:
         settings = Settings(
             project_root=PROJECT_ROOT,
-            deepseek_api_key=None,
+            llm_api_key=None,
             max_tool_rounds=max_tool_rounds,
         )
         model = ScriptedChatModel(script=script)
@@ -333,7 +342,8 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.answer, "SQL 工具返回了两条课程记录 [id:1] [id:2]。")
 
         first, second, third = model.seen[:3]
-        self.assertEqual(first["tool_choice"], "required")
+        # No tool_choice="required": Qwen rejects it, so evidence is enforced by a reminder.
+        self.assertIsNone(first["tool_choice"])
         self.assertEqual(set(first["tool_names"]), {SQL_TOOL_NAME, VECTOR_TOOL_NAME})
         self.assertIsNone(second["tool_choice"])
         self.assertIn("row_count", second["messages"][-1])
@@ -346,7 +356,6 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         # Earlier turns reach the model as question/answer text only.
         self.assertEqual(model.seen[3]["roles"], ["system", "human", "ai", "human"])
         self.assertEqual(model.seen[3]["messages"][2], "SQL 工具返回了两条课程记录 [id:1] [id:2]。")
-        self.assertEqual(model.seen[3]["tool_choice"], "required")
 
         history = await agent.get_history("session-a1")
         self.assertEqual(
@@ -378,15 +387,68 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.rounds, 1)
         self.assertIn("Only SELECT", result.calls[0].error)
-        self.assertIn("Only SELECT", model.seen[1]["messages"][-1])
+        self.assertIn("Only SELECT", model.seen[1]["messages"][-2])
         self.assertIn("230101", model.seen[0]["messages"][0])
-        # After the round limit the model is called without tools for the final answer.
+        # After the round limit the model is called without tools and told to answer now.
         self.assertIsNone(model.seen[1]["tool_names"])
+        self.assertEqual(model.seen[1]["messages"][-1], FINAL_ROUND_NOTE)
+        # The nudge is request-only and never becomes part of the stored conversation.
+        history = await agent.get_history("session-b1")
+        self.assertEqual([item.content for item in history], ["删除课程", "无法执行写操作，证据不足。"])
 
-    async def test_langchain_agent_requires_tool_evidence(self) -> None:
-        agent, _ = self._agent([AIMessage(content="我猜有课。")])
-        with self.assertRaisesRegex(ValueError, "did not call a retrieval tool"):
-            await agent.run("230101班有什么课", result_limit=3, session_id="session-c1")
+    async def test_langchain_agent_rejects_leaked_tool_markup(self) -> None:
+        leaked = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"query_schedule_sql\">"
+        agent, model = self._agent(
+            [
+                _tool_call("call_1", SQL_TOOL_NAME, {"sql": "SELECT id FROM courses LIMIT 1"}),
+                AIMessage(content=leaked),
+                _tool_call("call_2", SQL_TOOL_NAME, {"sql": "SELECT id FROM courses LIMIT 1"}),
+                AIMessage(content="找到一条记录。"),
+            ],
+            max_tool_rounds=1,
+        )
+        with self.assertRaisesRegex(ValueError, "no usable final answer"):
+            await agent.run("有哪些课", result_limit=3, session_id="session-d1")
+        result = await agent.run("再查一次", result_limit=3, session_id="session-d1")
+        self.assertEqual(result.answer, "找到一条记录。")
+        # The leaked markup is neither replayed to the model nor shown in history.
+        self.assertFalse(any("DSML" in text for text in model.seen[2]["messages"]))
+        history = await agent.get_history("session-d1")
+        self.assertFalse(any("DSML" in item.content for item in history))
+
+    async def test_langchain_agent_keeps_toolless_reply_after_one_reminder(self) -> None:
+        refusal = "我无法执行 DELETE 操作，只能做只读查询。"
+        agent, model = self._agent([AIMessage(content="不能删除。"), AIMessage(content=refusal)])
+        result = await agent.run("执行 DELETE FROM courses", result_limit=3, session_id="session-c1")
+        # Exactly one reminder; the second tool-free reply is kept but carries no evidence.
+        self.assertEqual(len(model.seen), 2)
+        self.assertEqual(model.seen[1]["messages"][-1], TOOL_NUDGE)
+        self.assertEqual(result.answer, refusal)
+        self.assertEqual(result.calls, [])
+
+    async def test_service_labels_answers_without_tool_evidence(self) -> None:
+        agent, _ = self._agent([AIMessage(content="你是哪个班的？"), AIMessage(content="请告诉我你的班级号。")])
+        service = ToolCallingRAGService(self.settings, self.retriever, agent)
+        response = await service.query(QueryRequest(question="我明天有什么课"))
+        self.assertEqual(response.mode, "tool_calling")
+        self.assertEqual(response.answer, "请告诉我你的班级号。")
+        self.assertIn("没有查询课表数据", response.warnings[0])
+
+    async def test_langchain_agent_reminds_model_to_use_tools_once(self) -> None:
+        agent, model = self._agent(
+            [
+                AIMessage(content="我猜有课。"),
+                _tool_call("call_1", SQL_TOOL_NAME, {"sql": "SELECT id FROM courses LIMIT 1"}),
+                AIMessage(content="查到一条记录。"),
+            ]
+        )
+        result = await agent.run("230101班有什么课", result_limit=3, session_id="session-e1")
+        self.assertEqual(result.answer, "查到一条记录。")
+        self.assertEqual(result.rounds, 1)
+        self.assertEqual(model.seen[1]["messages"][-1], TOOL_NUDGE)
+        # Neither the unfounded first reply nor the reminder is stored.
+        history = await agent.get_history("session-e1")
+        self.assertEqual([item.content for item in history], ["230101班有什么课", "查到一条记录。"])
 
     def test_fastapi_session_endpoints(self) -> None:
         agent, _ = self._agent(
@@ -419,9 +481,10 @@ class RAGBackendTests(unittest.IsolatedAsyncioTestCase):
     def test_fastapi_health_and_local_query(self) -> None:
         app = create_app(settings=self.settings, retriever=self.retriever)
         with TestClient(app) as client:
-            root = client.get("/", follow_redirects=False)
-            self.assertEqual(root.status_code, 307)
-            self.assertEqual(root.headers["location"], "/docs")
+            root = client.get("/")
+            self.assertEqual(root.status_code, 200)
+            self.assertIn("text/html", root.headers["content-type"])
+            self.assertIn("北工大课表助手", root.text)
             health = client.get("/health")
             self.assertEqual(health.status_code, 200)
             self.assertEqual(health.json()["indexed_records"], 11115)

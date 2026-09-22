@@ -142,7 +142,7 @@
     "id": "semantic-ai",
     "category": "semantic",
     "question": "有没有和人工智能相关的课？",
-    "check": "keywords_in_results",
+    "check": "keywords_in_answer",
     "keywords": [
       "人工智能",
       "AI",
@@ -156,7 +156,7 @@
     "id": "semantic-robot",
     "category": "semantic",
     "question": "我想找机器人方向的课程",
-    "check": "keywords_in_results",
+    "check": "keywords_in_answer",
     "keywords": [
       "机器人"
     ],
@@ -166,7 +166,7 @@
     "id": "semantic-database",
     "category": "semantic",
     "question": "有哪些讲数据库的课",
-    "check": "keywords_in_results",
+    "check": "keywords_in_answer",
     "keywords": [
       "数据库",
       "MySQL"
@@ -177,7 +177,7 @@
     "id": "semantic-innovation",
     "category": "semantic",
     "question": "推荐一些创新创业类的课程",
-    "check": "keywords_in_results",
+    "check": "keywords_in_answer",
     "keywords": [
       "创新",
       "创业"
@@ -188,7 +188,7 @@
     "id": "semantic-art-history",
     "category": "semantic",
     "question": "有没有讲美术史的课？",
-    "check": "keywords_in_results",
+    "check": "keywords_in_answer",
     "keywords": [
       "美术史"
     ],
@@ -198,7 +198,7 @@
     "id": "semantic-chip",
     "category": "semantic",
     "question": "芯片设计相关的课有哪些，谁在教？",
-    "check": "keywords_in_results",
+    "check": "keywords_in_answer",
     "keywords": [
       "集成电路",
       "芯片",
@@ -212,7 +212,7 @@
     "id": "semantic-class-scoped",
     "category": "semantic",
     "question": "240803班有没有和编程或数据相关的课？",
-    "check": "keywords_in_results",
+    "check": "keywords_in_answer",
     "keywords": [
       "数据",
       "程序",
